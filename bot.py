@@ -97,4 +97,4 @@ while True:
     except Exception as e:
         telegram(f"Error: {e}")
 
-    time.sleep(30)  # 🔥 REALTIME (30 segundos)
+    time.sleep(10)  # 🔥 REALTIME (30 segundos)
