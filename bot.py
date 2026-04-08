@@ -70,6 +70,10 @@ def computrabajo():
     return jobs
 
 # -------- LOOP REALTIME --------
+
+telegram("✅ Bot iniciado correctamente")
+whatsapp("✅ Bot iniciado correctamente")
+
 while True:
     try:
         trabajos = []
