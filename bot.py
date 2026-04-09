@@ -6,7 +6,7 @@ import os
 import re
 
 # ==============================
-# ⚙️ CONFIG
+# CONFIG
 # ==============================
 BUSQUEDA = "empleos osorno chile"
 INTERVALO = 600
@@ -15,13 +15,8 @@ ENVIADOS_FILE = "enviados.txt"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0"
-}
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# ==============================
-# LOGS
-# ==============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ==============================
@@ -30,10 +25,14 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 def limpiar(texto):
     return re.sub(r"\s+", " ", texto).strip()
 
-def es_basura(texto):
-    texto = texto.lower()
-    basura = ["términos", "privacidad", "login", "registr", "contacto", "cookies"]
-    return any(p in texto for p in basura)
+def limpiar_titulo(texto):
+    basura = ["Postulado", "Vista", "Guardar", "Denunciar", "Ocultar", "Mostrar"]
+    for b in basura:
+        texto = texto.replace(b, "")
+    return limpiar(texto)
+
+def detectar_postulado(texto):
+    return "✅ YA POSTULASTE" if "postulado" in texto.lower() else "🆕 NUEVO"
 
 # ==============================
 # DUPLICADOS
@@ -68,163 +67,134 @@ def enviar(msg):
         logging.error(f"Error Telegram: {e}")
 
 # ==============================
+# EXTRAER DESCRIPCIÓN COMPLETA
+# ==============================
+def obtener_descripcion(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        # intentar varios selectores comunes
+        posibles = [
+            ".description",
+            ".job-description",
+            "#jobDescription",
+            "article",
+            ".contenido"
+        ]
+
+        for sel in posibles:
+            bloque = soup.select_one(sel)
+            if bloque:
+                texto = limpiar(bloque.text)
+                if len(texto) > 100:
+                    return texto[:800]  # limitar largo
+
+        return "Descripción no disponible"
+
+    except:
+        return "No se pudo cargar descripción"
+
+# ==============================
 # EXTRAER INFO
 # ==============================
 def extraer_info(texto):
     sueldo = "No especificado"
-    empresa = "No especificada"
+    jornada = ""
+    
+    if "part time" in texto.lower():
+        jornada = "Part Time"
+    elif "full time" in texto.lower():
+        jornada = "Full Time"
 
     match = re.search(r"\$[\d\.\,]+", texto)
     if match:
         sueldo = match.group(0)
 
-    if "empresa" in texto.lower():
-        empresa = "Indicada en aviso"
-
-    return empresa, sueldo
+    return sueldo, jornada
 
 # ==============================
-# SCRAPERS REALES
+# SCRAPERS
 # ==============================
 
-# 🟢 CHILETRABAJOS
 def buscar_chiletrabajos():
     trabajos = []
     url = "https://www.chiletrabajos.cl/trabajo/?q=osorno"
 
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get(url, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
         for item in soup.select("article"):
-            titulo = limpiar(item.text)
             link_tag = item.find("a")
-
             if not link_tag:
                 continue
 
+            titulo = limpiar(item.text)
             link = link_tag.get("href")
 
-            if not titulo or len(titulo) < 15 or es_basura(titulo):
+            if len(titulo) < 20:
                 continue
 
-            trabajos.append({
-                "titulo": titulo,
-                "link": link,
-                "fuente": "Chiletrabajos"
-            })
+            trabajos.append({"titulo": titulo, "link": link, "fuente": "Chiletrabajos"})
+    except:
+        pass
 
-    except Exception as e:
-        logging.error(f"Chiletrabajos error: {e}")
-
-    logging.info(f"Chiletrabajos: {len(trabajos)}")
     return trabajos
 
 
-# 🟢 COMPUTRABAJO
 def buscar_computrabajo():
     trabajos = []
     url = "https://www.computrabajo.cl/trabajo-de-osorno"
 
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get(url, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
         for item in soup.select("article"):
-            titulo = limpiar(item.text)
             link_tag = item.find("a")
-
             if not link_tag:
                 continue
 
+            titulo = limpiar(item.text)
             link = "https://www.computrabajo.cl" + link_tag.get("href")
 
-            if not titulo or len(titulo) < 15 or es_basura(titulo):
+            if len(titulo) < 20:
                 continue
 
-            trabajos.append({
-                "titulo": titulo,
-                "link": link,
-                "fuente": "Computrabajo"
-            })
+            trabajos.append({"titulo": titulo, "link": link, "fuente": "Computrabajo"})
+    except:
+        pass
 
-    except Exception as e:
-        logging.error(f"Computrabajo error: {e}")
-
-    logging.info(f"Computrabajo: {len(trabajos)}")
     return trabajos
 
 
-# 🟢 BNE
 def buscar_bne():
     trabajos = []
     url = "https://www.bne.cl/ofertas?textoBusqueda=osorno"
 
     try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get(url, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for item in soup.select("a"):
-            titulo = limpiar(item.text)
-            link = item.get("href")
-
-            if not titulo or len(titulo) < 20:
-                continue
+        for a in soup.select("a"):
+            titulo = limpiar(a.text)
+            link = a.get("href")
 
             if "/oferta/" not in str(link):
                 continue
 
-            link = "https://www.bne.cl" + link
+            if len(titulo) < 20:
+                continue
 
             trabajos.append({
                 "titulo": titulo,
-                "link": link,
+                "link": "https://www.bne.cl" + link,
                 "fuente": "BNE"
             })
+    except:
+        pass
 
-    except Exception as e:
-        logging.error(f"BNE error: {e}")
-
-    logging.info(f"BNE: {len(trabajos)}")
-    return trabajos
-
-
-# 🟡 YAPO (filtrado)
-def buscar_yapo():
-    trabajos = []
-    url = "https://www.yapo.cl/region_de_los_lagos/empleos"
-
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for item in soup.select("li"):
-            titulo = limpiar(item.text)
-            link_tag = item.find("a")
-
-            if not link_tag:
-                continue
-
-            link = link_tag.get("href")
-
-            if not titulo or len(titulo) < 20 or es_basura(titulo):
-                continue
-
-            if "/empleos" not in str(link):
-                continue
-
-            link = "https://www.yapo.cl" + link
-
-            trabajos.append({
-                "titulo": titulo,
-                "link": link,
-                "fuente": "Yapo"
-            })
-
-    except Exception as e:
-        logging.error(f"Yapo error: {e}")
-
-    logging.info(f"Yapo: {len(trabajos)}")
     return trabajos
 
 
@@ -238,16 +208,25 @@ def procesar(trabajos, enviados):
         if t["link"] in enviados:
             continue
 
-        empresa, sueldo = extraer_info(t["titulo"])
+        titulo_limpio = limpiar_titulo(t["titulo"])
+        estado = detectar_postulado(t["titulo"])
+        sueldo, jornada = extraer_info(t["titulo"])
 
-        mensaje = f"""🔥 NUEVA OFERTA
+        descripcion = obtener_descripcion(t["link"])
 
-📌 {t['titulo']}
+        mensaje = f"""🔥 OFERTA DE TRABAJO
 
-🏢 Empresa: {empresa}
+📌 {titulo_limpio[:120]}
+
+{estado}
+
+🕒 Jornada: {jornada}
 💰 Sueldo: {sueldo}
 
-🌐 Fuente: {t['fuente']}
+📝 Descripción:
+{descripcion[:500]}
+
+🌐 {t['fuente']}
 🔗 {t['link']}
 """
 
@@ -262,8 +241,8 @@ def procesar(trabajos, enviados):
 # MAIN
 # ==============================
 def main():
-    logging.info("🚀 BOT PROFESIONAL INICIADO")
-    enviar("🚀 Bot activo buscando trabajos reales en Osorno")
+    logging.info("🚀 BOT PRO CON DESCRIPCIÓN COMPLETA")
+    enviar("🚀 Bot activo con lectura completa de ofertas")
 
     while True:
         try:
@@ -273,7 +252,6 @@ def main():
             trabajos += buscar_chiletrabajos()
             trabajos += buscar_computrabajo()
             trabajos += buscar_bne()
-            trabajos += buscar_yapo()
 
             logging.info(f"Total encontrados: {len(trabajos)}")
 
