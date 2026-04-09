@@ -17,7 +17,6 @@ ULTRAMSG_INSTANCE = os.getenv("ULTRAMSG_INSTANCE")
 WHATSAPP_TO = os.getenv("WHATSAPP_TO")
 
 HEADERS = {"User-Agent": "Mozilla/5.0"}
-
 ARCHIVO = "vistos.json"
 
 # ================= UTIL =================
@@ -27,7 +26,7 @@ def cargar_vistos():
             return set(json.load(f))
     return set()
 
-def guardar_visto(vistos):
+def guardar_vistos(vistos):
     with open(ARCHIVO, "w") as f:
         json.dump(list(vistos), f)
 
@@ -71,7 +70,6 @@ def enviar_whatsapp(msg):
 
 # ================= FUENTES =================
 
-# 1. INDEED (HTML fallback)
 def fuente_indeed():
     jobs = []
     try:
@@ -82,9 +80,7 @@ def fuente_indeed():
         for job in soup.select("a.tapItem"):
             titulo = job.get_text(strip=True)
             link = "https://cl.indeed.com" + job.get("href")
-
             jobs.append((titulo, link, "Indeed"))
-
     except Exception as e:
         print("Indeed error:", e)
 
@@ -92,7 +88,6 @@ def fuente_indeed():
     return jobs
 
 
-# 2. YAPO
 def fuente_yapo():
     jobs = []
     try:
@@ -106,7 +101,6 @@ def fuente_yapo():
 
             if link and "yapo.cl" in link:
                 jobs.append((titulo, link, "Yapo"))
-
     except Exception as e:
         print("Yapo error:", e)
 
@@ -114,7 +108,6 @@ def fuente_yapo():
     return jobs
 
 
-# 3. GOOGLE JOBS (MUY POTENTE)
 def fuente_google():
     jobs = []
     try:
@@ -128,7 +121,6 @@ def fuente_google():
 
             if titulo and "http" in str(link):
                 jobs.append((titulo, link, "Google"))
-
     except Exception as e:
         print("Google error:", e)
 
@@ -136,7 +128,6 @@ def fuente_google():
     return jobs
 
 
-# 4. FACEBOOK INDIRECTO
 def fuente_facebook():
     jobs = []
     try:
@@ -150,7 +141,6 @@ def fuente_facebook():
 
             if "facebook.com" in str(link):
                 jobs.append((titulo, link, "Facebook"))
-
     except Exception as e:
         print("Facebook error:", e)
 
@@ -158,17 +148,58 @@ def fuente_facebook():
     return jobs
 
 
+def fuente_computrabajo():
+    jobs = []
+    try:
+        url = "https://www.computrabajo.cl/trabajo-de-osorno"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for item in soup.select("article"):
+            tag = item.select_one("h2 a")
+            if tag:
+                titulo = tag.get_text(strip=True)
+                link = "https://www.computrabajo.cl" + tag.get("href")
+                jobs.append((titulo, link, "Computrabajo"))
+    except Exception as e:
+        print("Computrabajo error:", e)
+
+    print("Computrabajo:", len(jobs))
+    return jobs
+
+
+def fuente_chiletrabajos():
+    jobs = []
+    try:
+        url = "https://www.chiletrabajos.cl/busqueda/?q=osorno"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for item in soup.select("a"):
+            titulo = item.get_text(strip=True)
+            link = item.get("href")
+
+            if link and "/oferta/" in str(link):
+                jobs.append((titulo, link, "Chiletrabajos"))
+    except Exception as e:
+        print("Chiletrabajos error:", e)
+
+    print("Chiletrabajos:", len(jobs))
+    return jobs
+
+
 # ================= MOTOR =================
-def obtener_todo():
+def obtener_trabajos():
     trabajos = []
     trabajos += fuente_indeed()
     trabajos += fuente_yapo()
     trabajos += fuente_google()
     trabajos += fuente_facebook()
+    trabajos += fuente_computrabajo()
+    trabajos += fuente_chiletrabajos()
 
     print("TOTAL bruto:", len(trabajos))
 
-    # filtro inteligente
     filtrados = []
     for t, l, f in trabajos:
         if contiene_keyword(t) and CIUDAD.lower() in t.lower():
@@ -178,15 +209,14 @@ def obtener_todo():
     return filtrados
 
 
-# ================= MAIN LOOP =================
+# ================= MAIN =================
 vistos = cargar_vistos()
 
 while True:
     try:
         print("\n🔎 Buscando trabajos...")
 
-        trabajos = obtener_todo()
-
+        trabajos = obtener_trabajos()
         nuevos = 0
 
         for titulo, link, fuente in trabajos:
@@ -199,11 +229,11 @@ while True:
                 enviar_whatsapp(msg)
 
                 vistos.add(clave)
-                guardar_visto(vistos)
+                guardar_vistos(vistos)
 
                 nuevos += 1
 
-        print("Nuevos enviados:", nuevos)
+        print("📩 Nuevos enviados:", nuevos)
 
     except Exception as e:
         print("ERROR GENERAL:", e)
