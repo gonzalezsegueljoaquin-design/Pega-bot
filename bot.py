@@ -4,235 +4,272 @@ import time
 import logging
 import os
 import re
+from datetime import datetime, timedelta
 
 # ==============================
 # CONFIG
 # ==============================
-BUSQUEDA = "empleos osorno chile"
-INTERVALO = 600
+INTERVALO = 600          # segundos entre ciclos
+MAX_ENVIADOS = 2000      # límite de links guardados (rota el archivo)
+TIMEOUT = 10             # segundos por request HTTP
+DELAY_ENTRE_REQUESTS = 1.5  # pausa entre fetches para no ser bloqueado
+
 ENVIADOS_FILE = "enviados.txt"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("bot_empleos.log", encoding="utf-8"),
+    ]
+)
+log = logging.getLogger(__name__)
+
 
 # ==============================
-# UTILIDADES
+# UTILIDADES DE TEXTO
 # ==============================
-def limpiar(texto):
+
+def limpiar(texto: str) -> str:
     return re.sub(r"\s+", " ", texto).strip()
 
-def limpiar_titulo(texto):
-    basura = ["Postulado", "Vista", "Guardar", "Denunciar", "Ocultar", "Mostrar"]
-    for b in basura:
+BASURA_TITULO = {"Postulado", "Vista", "Guardar", "Denunciar", "Ocultar", "Mostrar"}
+
+def limpiar_titulo(texto: str) -> str:
+    for b in BASURA_TITULO:
         texto = texto.replace(b, "")
     return limpiar(texto)
 
-def detectar_postulado(texto):
-    return "✅ YA POSTULASTE" if "postulado" in texto.lower() else "🆕 NUEVO"
+def extraer_info(texto: str) -> tuple[str, str]:
+    texto_lower = texto.lower()
+    if "part time" in texto_lower:
+        jornada = "Part Time"
+    elif "full time" in texto_lower:
+        jornada = "Full Time"
+    else:
+        jornada = "No especificada"
+
+    match = re.search(r"\$[\d\.\,]+", texto)
+    sueldo = match.group(0) if match else "No especificado"
+
+    return sueldo, jornada
+
+def escape_telegram(texto: str) -> str:
+    """Escapa caracteres que pueden romper mensajes de Telegram."""
+    # Para parse_mode=None (texto plano) no es necesario, pero protege contra
+    # ampersands u otros chars que algunos clientes muestran raro
+    return texto.replace("&", "&amp;")
+
 
 # ==============================
-# DUPLICADOS
+# DUPLICADOS (con rotación)
 # ==============================
-def cargar_enviados():
+
+def cargar_enviados() -> set:
     try:
-        with open(ENVIADOS_FILE, "r") as f:
+        with open(ENVIADOS_FILE, "r", encoding="utf-8") as f:
             return set(f.read().splitlines())
-    except:
+    except FileNotFoundError:
         return set()
 
-def guardar_enviado(link):
-    with open(ENVIADOS_FILE, "a") as f:
-        f.write(link + "\n")
+def guardar_enviado(link: str, enviados: set) -> None:
+    enviados.add(link)
+    # Rotar archivo si supera el límite
+    lines = list(enviados)
+    if len(lines) > MAX_ENVIADOS:
+        lines = lines[-MAX_ENVIADOS:]
+        enviados.clear()
+        enviados.update(lines)
+    with open(ENVIADOS_FILE, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
 
 # ==============================
 # TELEGRAM
 # ==============================
-def enviar(msg):
+
+def enviar(msg: str, reintentos: int = 3) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Faltan variables de Telegram")
-        return
+        log.error("Faltan variables de entorno TELEGRAM_TOKEN o TELEGRAM_CHAT_ID")
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
 
-    try:
-        requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": msg
-        })
-    except Exception as e:
-        logging.error(f"Error Telegram: {e}")
+    for intento in range(1, reintentos + 1):
+        try:
+            r = requests.post(url, data=payload, timeout=TIMEOUT)
+            if r.status_code == 200:
+                return True
+            log.warning(f"Telegram devolvió {r.status_code} (intento {intento}): {r.text[:200]}")
+        except requests.RequestException as e:
+            log.warning(f"Error de red enviando a Telegram (intento {intento}): {e}")
+        time.sleep(2 * intento)
+
+    log.error(f"No se pudo enviar mensaje a Telegram tras {reintentos} intentos")
+    return False
+
 
 # ==============================
-# EXTRAER DESCRIPCIÓN COMPLETA
+# SCRAPING CON REINTENTOS
 # ==============================
-def obtener_descripcion(url):
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        soup = BeautifulSoup(r.text, "html.parser")
 
-        # intentar varios selectores comunes
-        posibles = [
-            ".description",
-            ".job-description",
-            "#jobDescription",
-            "article",
-            ".contenido"
-        ]
+def get_soup(url: str, reintentos: int = 2) -> BeautifulSoup | None:
+    for intento in range(1, reintentos + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            r.raise_for_status()
+            return BeautifulSoup(r.text, "html.parser")
+        except requests.RequestException as e:
+            log.warning(f"Error GET {url} (intento {intento}): {e}")
+            time.sleep(DELAY_ENTRE_REQUESTS * intento)
+    return None
 
-        for sel in posibles:
-            bloque = soup.select_one(sel)
-            if bloque:
-                texto = limpiar(bloque.text)
-                if len(texto) > 100:
-                    return texto[:800]  # limitar largo
 
-        return "Descripción no disponible"
-
-    except:
+def obtener_descripcion(url: str) -> str:
+    time.sleep(DELAY_ENTRE_REQUESTS)  # rate limiting
+    soup = get_soup(url)
+    if not soup:
         return "No se pudo cargar descripción"
 
-# ==============================
-# EXTRAER INFO
-# ==============================
-def extraer_info(texto):
-    sueldo = "No especificado"
-    jornada = ""
-    
-    if "part time" in texto.lower():
-        jornada = "Part Time"
-    elif "full time" in texto.lower():
-        jornada = "Full Time"
+    selectores = [
+        ".description", ".job-description", "#jobDescription",
+        "article", ".contenido", "[class*='description']", "main"
+    ]
+    for sel in selectores:
+        bloque = soup.select_one(sel)
+        if bloque:
+            texto = limpiar(bloque.get_text(separator=" "))
+            if len(texto) > 100:
+                return texto[:600]
 
-    match = re.search(r"\$[\d\.\,]+", texto)
-    if match:
-        sueldo = match.group(0)
+    # fallback: body completo truncado
+    body = soup.find("body")
+    if body:
+        texto = limpiar(body.get_text(separator=" "))
+        if len(texto) > 100:
+            return texto[:400]
 
-    return sueldo, jornada
+    return "Descripción no disponible"
+
 
 # ==============================
 # SCRAPERS
 # ==============================
 
-def buscar_chiletrabajos():
+def buscar_chiletrabajos() -> list[dict]:
     trabajos = []
-    url = "https://www.chiletrabajos.cl/trabajo/?q=osorno"
+    soup = get_soup("https://www.chiletrabajos.cl/trabajo/?q=osorno")
+    if not soup:
+        log.warning("Chiletrabajos: no se pudo conectar")
+        return trabajos
 
-    try:
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
+    for item in soup.select("article"):
+        link_tag = item.find("a", href=True)
+        if not link_tag:
+            continue
+        titulo = limpiar(item.get_text(separator=" "))
+        if len(titulo) < 20:
+            continue
+        href = link_tag["href"]
+        if not href.startswith("http"):
+            href = "https://www.chiletrabajos.cl" + href
+        trabajos.append({"titulo": titulo, "link": href, "fuente": "Chiletrabajos"})
 
-        for item in soup.select("article"):
-            link_tag = item.find("a")
-            if not link_tag:
-                continue
-
-            titulo = limpiar(item.text)
-            link = link_tag.get("href")
-
-            if len(titulo) < 20:
-                continue
-
-            trabajos.append({"titulo": titulo, "link": link, "fuente": "Chiletrabajos"})
-    except:
-        pass
-
+    log.info(f"Chiletrabajos: {len(trabajos)} ofertas encontradas")
     return trabajos
 
 
-def buscar_computrabajo():
+def buscar_computrabajo() -> list[dict]:
     trabajos = []
-    url = "https://www.computrabajo.cl/trabajo-de-osorno"
+    soup = get_soup("https://www.computrabajo.cl/trabajo-de-osorno")
+    if not soup:
+        log.warning("Computrabajo: no se pudo conectar")
+        return trabajos
 
-    try:
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
+    for item in soup.select("article"):
+        link_tag = item.find("a", href=True)
+        if not link_tag:
+            continue
+        titulo = limpiar(item.get_text(separator=" "))
+        if len(titulo) < 20:
+            continue
+        href = link_tag["href"]
+        if not href.startswith("http"):
+            href = "https://www.computrabajo.cl" + href
+        trabajos.append({"titulo": titulo, "link": href, "fuente": "Computrabajo"})
 
-        for item in soup.select("article"):
-            link_tag = item.find("a")
-            if not link_tag:
-                continue
-
-            titulo = limpiar(item.text)
-            link = "https://www.computrabajo.cl" + link_tag.get("href")
-
-            if len(titulo) < 20:
-                continue
-
-            trabajos.append({"titulo": titulo, "link": link, "fuente": "Computrabajo"})
-    except:
-        pass
-
+    log.info(f"Computrabajo: {len(trabajos)} ofertas encontradas")
     return trabajos
 
 
-def buscar_bne():
+def buscar_bne() -> list[dict]:
     trabajos = []
-    url = "https://www.bne.cl/ofertas?textoBusqueda=osorno"
+    soup = get_soup("https://www.bne.cl/ofertas?textoBusqueda=osorno")
+    if not soup:
+        log.warning("BNE: no se pudo conectar")
+        return trabajos
 
-    try:
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
+    for a in soup.select("a[href]"):
+        if "/oferta/" not in a["href"]:
+            continue
+        titulo = limpiar(a.get_text(separator=" "))
+        if len(titulo) < 20:
+            continue
+        trabajos.append({
+            "titulo": titulo,
+            "link": "https://www.bne.cl" + a["href"],
+            "fuente": "BNE"
+        })
 
-        for a in soup.select("a"):
-            titulo = limpiar(a.text)
-            link = a.get("href")
-
-            if "/oferta/" not in str(link):
-                continue
-
-            if len(titulo) < 20:
-                continue
-
-            trabajos.append({
-                "titulo": titulo,
-                "link": "https://www.bne.cl" + link,
-                "fuente": "BNE"
-            })
-    except:
-        pass
-
+    log.info(f"BNE: {len(trabajos)} ofertas encontradas")
     return trabajos
 
 
 # ==============================
-# PROCESAR
+# PROCESAR Y ENVIAR
 # ==============================
-def procesar(trabajos, enviados):
+
+def procesar(trabajos: list[dict], enviados: set) -> int:
     nuevos = 0
 
     for t in trabajos:
-        if t["link"] in enviados:
+        link = t["link"]
+        if link in enviados:
             continue
 
-        titulo_limpio = limpiar_titulo(t["titulo"])
-        estado = detectar_postulado(t["titulo"])
+        titulo_limpio = limpiar_titulo(t["titulo"])[:120]
         sueldo, jornada = extraer_info(t["titulo"])
+        descripcion = obtener_descripcion(link)
 
-        descripcion = obtener_descripcion(t["link"])
+        mensaje = (
+            f"🔥 OFERTA DE TRABAJO\n\n"
+            f"📌 {escape_telegram(titulo_limpio)}\n\n"
+            f"🕒 Jornada: {jornada}\n"
+            f"💰 Sueldo: {sueldo}\n\n"
+            f"📝 Descripción:\n{escape_telegram(descripcion[:500])}\n\n"
+            f"🌐 {t['fuente']}\n"
+            f"🔗 {link}"
+        )
 
-        mensaje = f"""🔥 OFERTA DE TRABAJO
-
-📌 {titulo_limpio[:120]}
-
-{estado}
-
-🕒 Jornada: {jornada}
-💰 Sueldo: {sueldo}
-
-📝 Descripción:
-{descripcion[:500]}
-
-🌐 {t['fuente']}
-🔗 {t['link']}
-"""
-
-        enviar(mensaje)
-        guardar_enviado(t["link"])
-        nuevos += 1
+        if enviar(mensaje):
+            guardar_enviado(link, enviados)
+            nuevos += 1
+            log.info(f"Enviado: {titulo_limpio[:60]}")
+        else:
+            log.error(f"No se pudo enviar oferta: {link}")
 
     return nuevos
 
@@ -240,29 +277,50 @@ def procesar(trabajos, enviados):
 # ==============================
 # MAIN
 # ==============================
-def main():
-    logging.info("🚀 BOT PRO CON DESCRIPCIÓN COMPLETA")
-    enviar("🚀 Bot activo con lectura completa de ofertas")
+
+def main() -> None:
+    log.info("Bot de empleos iniciado")
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_TOKEN y TELEGRAM_CHAT_ID son requeridos. Saliendo.")
+        return
+
+    enviar("🚀 Bot de empleos Osorno activo")
 
     while True:
         try:
+            inicio = time.time()
             enviados = cargar_enviados()
 
-            trabajos = []
+            trabajos: list[dict] = []
             trabajos += buscar_chiletrabajos()
             trabajos += buscar_computrabajo()
             trabajos += buscar_bne()
 
-            logging.info(f"Total encontrados: {len(trabajos)}")
+            # Eliminar duplicados por link dentro del mismo ciclo
+            vistos = set()
+            trabajos_unicos = []
+            for t in trabajos:
+                if t["link"] not in vistos:
+                    vistos.add(t["link"])
+                    trabajos_unicos.append(t)
 
-            nuevos = procesar(trabajos, enviados)
+            log.info(f"Total encontrados: {len(trabajos_unicos)} (sin duplicates)")
 
-            logging.info(f"Nuevos enviados: {nuevos}")
+            nuevos = procesar(trabajos_unicos, enviados)
+            log.info(f"Nuevos enviados: {nuevos}")
 
+            elapsed = time.time() - inicio
+            espera = max(0, INTERVALO - elapsed)
+            log.info(f"Ciclo terminado en {elapsed:.1f}s. Próxima búsqueda en {espera:.0f}s")
+            time.sleep(espera)
+
+        except KeyboardInterrupt:
+            log.info("Bot detenido por el usuario")
+            break
         except Exception as e:
-            logging.error(f"ERROR: {e}")
-
-        time.sleep(INTERVALO)
+            log.exception(f"Error inesperado en el ciclo principal: {e}")
+            time.sleep(60)  # esperar antes de reintentar
 
 
 if __name__ == "__main__":
