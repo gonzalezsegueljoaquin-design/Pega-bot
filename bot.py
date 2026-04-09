@@ -1,281 +1,211 @@
 import requests
+from bs4 import BeautifulSoup
 import time
 import hashlib
 import os
-import logging
-import sqlite3
-from datetime import datetime, timedelta
-import feedparser
-from bs4 import BeautifulSoup
+import json
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
-)
-log = logging.getLogger(__name__)
-
-# ---------------- CONFIG ----------------
-TOKEN       = os.getenv("TOKEN")
-CHAT_ID     = os.getenv("CHAT_ID")
-TWILIO_SID  = os.getenv("TWILIO_SID")
-TWILIO_AUTH = os.getenv("TWILIO_AUTH")
-TWILIO_FROM = os.getenv("TWILIO_FROM")
-TWILIO_TO   = os.getenv("TWILIO_TO")
-
+# ================= CONFIG =================
 CIUDAD = "Osorno"
+KEYWORDS = ["trabajo", "operario", "bodega", "reponedor", "auxiliar"]
 
-KEYWORDS = [
-    "bodega", "operario", "logistica", "reponedor",
-    "chofer", "peoneta", "auxiliar", "produccion",
-    "ayudante", "asistente", "ventas", "tienda",
-    "aseo", "limpieza", "repartidor", "almacen"
-]
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-REQUEST_TIMEOUT = 10
-INTERVALO       = 60
-DIAS_RETENCION  = 30
+ULTRAMSG_TOKEN = os.getenv("ULTRAMSG_TOKEN")
+ULTRAMSG_INSTANCE = os.getenv("ULTRAMSG_INSTANCE")
+WHATSAPP_TO = os.getenv("WHATSAPP_TO")
 
-# ---------------- PERSISTENCIA (SQLite) ----------------
-def init_db():
-    con = sqlite3.connect("seen.db")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS vistos (
-            clave TEXT PRIMARY KEY,
-            fecha TEXT NOT NULL
-        )
-    """)
-    con.commit()
-    return con
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-def cargar_vistos(con):
-    rows = con.execute("SELECT clave FROM vistos").fetchall()
-    return {r[0] for r in rows}
+ARCHIVO = "vistos.json"
 
-def guardar_visto(con, clave):
-    con.execute(
-        "INSERT OR IGNORE INTO vistos (clave, fecha) VALUES (?, ?)",
-        (clave, datetime.now().isoformat())
-    )
-    con.commit()
+# ================= UTIL =================
+def cargar_vistos():
+    if os.path.exists(ARCHIVO):
+        with open(ARCHIVO, "r") as f:
+            return set(json.load(f))
+    return set()
 
-def limpiar_viejos(con):
-    limite = (datetime.now() - timedelta(days=DIAS_RETENCION)).isoformat()
-    eliminados = con.execute(
-        "DELETE FROM vistos WHERE fecha < ?", (limite,)
-    ).rowcount
-    con.commit()
-    if eliminados:
-        log.info(f"Limpieza: {eliminados} registros viejos eliminados")
+def guardar_visto(vistos):
+    with open(ARCHIVO, "w") as f:
+        json.dump(list(vistos), f)
 
-# ---------------- UTIL ----------------
-def hash_item(texto: str) -> str:
+def hash_item(texto):
     return hashlib.md5(texto.encode()).hexdigest()
 
-def get_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-    return s
+def contiene_keyword(texto):
+    texto = texto.lower()
+    return any(k in texto for k in KEYWORDS)
 
-# ---------------- NOTIFICACIONES ----------------
-def telegram(msg: str):
-    """
-    FIX: sin parse_mode para evitar el error 400 Bad Request.
-    Telegram rechaza Markdown mal formateado (asteriscos sueltos, etc).
-    """
+# ================= MENSAJE =================
+def formatear(titulo, link, fuente):
+    return f"""🔥 NUEVA OFERTA
+
+📌 {titulo}
+
+🌐 Fuente: {fuente}
+🔗 {link}
+"""
+
+# ================= TELEGRAM =================
+def enviar_telegram(msg):
     try:
-        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-        r   = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "text": msg},
-            timeout=REQUEST_TIMEOUT
-        )
-        r.raise_for_status()
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
     except Exception as e:
-        log.error(f"Error Telegram: {e}")
+        print("Error Telegram:", e)
 
-def whatsapp(msg: str):
+# ================= WHATSAPP =================
+def enviar_whatsapp(msg):
     try:
-        url  = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_SID}/Messages.json"
+        url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat"
         data = {
-            "From": f"whatsapp:{TWILIO_FROM}",
-            "To":   f"whatsapp:{TWILIO_TO}",
-            "Body": msg
+            "token": ULTRAMSG_TOKEN,
+            "to": WHATSAPP_TO,
+            "body": msg
         }
-        r = requests.post(url, data=data, auth=(TWILIO_SID, TWILIO_AUTH), timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
+        requests.post(url, data=data)
     except Exception as e:
-        log.error(f"Error WhatsApp: {e}")
+        print("Error WhatsApp:", e)
 
-def notificar(msg: str):
-    telegram(msg)
-    whatsapp(msg)
+# ================= FUENTES =================
 
-# ---------------- FUENTES ----------------
-def indeed() -> list[tuple]:
-    """
-    FIX: el RSS de Indeed devuelve 0 sin keywords.
-    Se consultan 3 combinaciones para cubrir mas cargos.
-    """
-    jobs         = []
-    vistos_links = set()
-    urls = [
-        f"https://cl.indeed.com/rss?q=trabajo&l={CIUDAD}",
-        f"https://cl.indeed.com/rss?q=operario+bodega&l={CIUDAD}",
-        f"https://cl.indeed.com/rss?q=chofer+auxiliar&l={CIUDAD}",
-    ]
+# 1. INDEED (HTML fallback)
+def fuente_indeed():
+    jobs = []
     try:
-        for url in urls:
-            feed = feedparser.parse(url)
-            for e in feed.entries:
-                if e.link not in vistos_links:
-                    vistos_links.add(e.link)
-                    jobs.append((e.title, e.link, "Indeed"))
-        log.info(f"Indeed: {len(jobs)} avisos")
-        return jobs
-    except Exception as e:
-        log.error(f"Error Indeed: {e}")
-        return []
+        url = "https://cl.indeed.com/jobs?q=trabajo&l=Osorno"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-def chiletrabajos() -> list[tuple]:
-    """
-    FIX: prueba multiples slugs por si el RSS no responde a uno solo.
-    """
-    jobs         = []
-    vistos_links = set()
-    urls = [
-        "https://www.chiletrabajos.cl/rss/trabajos/osorno",
-        "https://www.chiletrabajos.cl/rss/trabajos/los-lagos",
-    ]
+        for job in soup.select("a.tapItem"):
+            titulo = job.get_text(strip=True)
+            link = "https://cl.indeed.com" + job.get("href")
+
+            jobs.append((titulo, link, "Indeed"))
+
+    except Exception as e:
+        print("Indeed error:", e)
+
+    print("Indeed:", len(jobs))
+    return jobs
+
+
+# 2. YAPO
+def fuente_yapo():
+    jobs = []
     try:
-        for url in urls:
-            feed = feedparser.parse(url)
-            for e in feed.entries:
-                if e.link not in vistos_links:
-                    vistos_links.add(e.link)
-                    jobs.append((e.title, e.link, "Chiletrabajos"))
-        log.info(f"Chiletrabajos: {len(jobs)} avisos")
-        return jobs
-    except Exception as e:
-        log.error(f"Error Chiletrabajos: {e}")
-        return []
+        url = "https://www.yapo.cl/region_de_los_lagos/empleos"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-def yapo(session: requests.Session) -> list[tuple]:
-    """
-    FIX: URL corregida a la estructura actual de Yapo Chile.
-    Antes:  /region_de_los_lagos/empleos?q=Osorno  (404)
-    Ahora:  /empleos-ofertas-de-trabajos/los-lagos-osorno
-    """
-    jobs         = []
-    vistos_links = set()
-    urls = [
-        "https://www.yapo.cl/empleos-ofertas-de-trabajos/los-lagos-osorno",
-        "https://www.yapo.cl/empleos-ofertas-de-trabajos/los-lagos-osorno.2",
-    ]
+        for item in soup.select("a"):
+            titulo = item.get_text(strip=True)
+            link = item.get("href")
+
+            if link and "yapo.cl" in link:
+                jobs.append((titulo, link, "Yapo"))
+
+    except Exception as e:
+        print("Yapo error:", e)
+
+    print("Yapo:", len(jobs))
+    return jobs
+
+
+# 3. GOOGLE JOBS (MUY POTENTE)
+def fuente_google():
+    jobs = []
     try:
-        for url in urls:
-            r = session.get(url, timeout=REQUEST_TIMEOUT)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
+        url = "https://www.google.com/search?q=trabajos+osorno"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-            for item in soup.select("a[href*='/avisos/']"):
-                titulo = item.get_text(strip=True)
-                href   = item.get("href", "")
+        for g in soup.select("a"):
+            titulo = g.get_text(strip=True)
+            link = g.get("href")
 
-                if not href.startswith("http"):
-                    href = "https://www.yapo.cl" + href
+            if titulo and "http" in str(link):
+                jobs.append((titulo, link, "Google"))
 
-                if not titulo or len(titulo) < 8 or href in vistos_links:
-                    continue
-
-                vistos_links.add(href)
-                jobs.append((titulo, href, "Yapo"))
-
-        log.info(f"Yapo: {len(jobs)} avisos")
-        return jobs
     except Exception as e:
-        log.error(f"Error Yapo: {e}")
-        return []
+        print("Google error:", e)
 
-def facebook() -> list[tuple]:
+    print("Google:", len(jobs))
+    return jobs
+
+
+# 4. FACEBOOK INDIRECTO
+def fuente_facebook():
+    jobs = []
     try:
-        url  = "https://rsshub.app/facebook/page/empleos.osorno"
-        feed = feedparser.parse(url)
-        jobs = [(e.title, e.link, "Facebook") for e in feed.entries]
-        log.info(f"Facebook: {len(jobs)} avisos")
-        return jobs
-    except Exception as e:
-        log.error(f"Error Facebook: {e}")
-        return []
+        url = "https://www.google.com/search?q=trabajo+osorno+facebook"
+        r = requests.get(url, headers=HEADERS)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-# ---------------- FILTRO ----------------
-def filtrar(trabajos: list[tuple]) -> list[tuple]:
+        for a in soup.select("a"):
+            link = a.get("href")
+            titulo = a.get_text(strip=True)
+
+            if "facebook.com" in str(link):
+                jobs.append((titulo, link, "Facebook"))
+
+    except Exception as e:
+        print("Facebook error:", e)
+
+    print("Facebook:", len(jobs))
+    return jobs
+
+
+# ================= MOTOR =================
+def obtener_todo():
+    trabajos = []
+    trabajos += fuente_indeed()
+    trabajos += fuente_yapo()
+    trabajos += fuente_google()
+    trabajos += fuente_facebook()
+
+    print("TOTAL bruto:", len(trabajos))
+
+    # filtro inteligente
     filtrados = []
-    for titulo, link, fuente in trabajos:
-        t = titulo.lower()
-        if any(k in t for k in KEYWORDS):
-            filtrados.append((titulo, link, fuente))
+    for t, l, f in trabajos:
+        if contiene_keyword(t) and CIUDAD.lower() in t.lower():
+            filtrados.append((t, l, f))
+
+    print("TOTAL filtrado:", len(filtrados))
     return filtrados
 
-# ---------------- MENSAJE ----------------
-def mensaje(titulo: str, link: str, fuente: str) -> str:
-    # Sin asteriscos ni caracteres Markdown para evitar errores de Telegram
-    return (
-        f"OFERTA DETECTADA\n\n"
-        f"{titulo}\n"
-        f"Fuente: {fuente}\n\n"
-        f"Postula aqui:\n{link}"
-    )
 
-# ---------------- MAIN ----------------
-def main():
-    con     = init_db()
-    vistos  = cargar_vistos(con)
-    session = get_session()
+# ================= MAIN LOOP =================
+vistos = cargar_vistos()
 
-    log.info("Bot iniciado")
-    notificar("BOT ACTIVADO - Buscando empleos en Osorno")
+while True:
+    try:
+        print("\n🔎 Buscando trabajos...")
 
-    ciclo = 0
-    while True:
-        try:
-            ciclo += 1
-            log.info(f"--- Ciclo {ciclo} ---")
+        trabajos = obtener_todo()
 
-            trabajos  = []
-            trabajos += indeed()
-            trabajos += chiletrabajos()
-            trabajos += yapo(session)
-            trabajos += facebook()
+        nuevos = 0
 
-            log.info(f"Total antes de filtro: {len(trabajos)}")
-            trabajos = filtrar(trabajos)
-            log.info(f"Total despues de filtro: {len(trabajos)}")
+        for titulo, link, fuente in trabajos:
+            clave = hash_item(link)
 
-            nuevos = 0
-            for titulo, link, fuente in trabajos:
-                clave = hash_item(link)
-                if clave not in vistos:
-                    msg = mensaje(titulo, link, fuente)
-                    notificar(msg)
-                    guardar_visto(con, clave)
-                    vistos.add(clave)
-                    nuevos += 1
+            if clave not in vistos:
+                msg = formatear(titulo, link, fuente)
 
-            log.info(f"Nuevos avisos enviados: {nuevos}")
+                enviar_telegram(msg)
+                enviar_whatsapp(msg)
 
-            if ciclo % 10080 == 0:
-                limpiar_viejos(con)
+                vistos.add(clave)
+                guardar_visto(vistos)
 
-        except Exception as e:
-            log.error(f"Error inesperado en ciclo: {e}")
-            telegram(f"Error inesperado: {e}")
+                nuevos += 1
 
-        time.sleep(INTERVALO)
+        print("Nuevos enviados:", nuevos)
 
-if __name__ == "__main__":
-    main()
+    except Exception as e:
+        print("ERROR GENERAL:", e)
+
+    time.sleep(180)
