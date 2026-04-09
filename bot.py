@@ -4,7 +4,7 @@ import time
 import os
 import json
 import logging
-from datetime import datetime
+import re
 
 # ================= CONFIG =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -39,7 +39,92 @@ def es_reciente(texto):
     texto = texto.lower()
     return any(x in texto for x in ["hoy", "ayer", "justo ahora", "reciente"])
 
-# ================= TELEGRAM =================
+def titulo_valido(titulo):
+    if not titulo:
+        return False
+
+    titulo = titulo.lower()
+    basura = ["here","click","retry","enablejs","javascript","error","httpservice"]
+
+    if any(b in titulo for b in basura):
+        return False
+
+    return len(titulo) > 8
+
+def link_valido(link):
+    if not link:
+        return False
+
+    if not link.startswith("http"):
+        return False
+
+    basura = ["google","enablejs","retry","httpservice"]
+
+    if any(b in link for b in basura):
+        return False
+
+    return True
+
+# ================= EXTRACCIÓN INTELIGENTE =================
+def extraer_info(url):
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        texto = soup.get_text(" ", strip=True)
+
+        # SUELDO
+        sueldo = "No especificado"
+        match = re.search(r"\$[\d\.\,]+", texto)
+        if match:
+            sueldo = match.group()
+
+        # EMPRESA
+        empresa = "No especificada"
+        posibles = ["empresa", "compañía", "company"]
+        for p in posibles:
+            if p in texto.lower():
+                empresa = p
+                break
+
+        # UBICACIÓN
+        ubicacion = "Osorno"
+        if "puerto montt" in texto.lower():
+            ubicacion = "Puerto Montt"
+
+        # JORNADA
+        jornada = "No especificada"
+        if "turno" in texto.lower():
+            jornada = "Turnos"
+        elif "full time" in texto.lower():
+            jornada = "Full Time"
+        elif "part time" in texto.lower():
+            jornada = "Part Time"
+
+        # REQUISITOS (texto resumido)
+        requisitos = "No especificados"
+        if "requisitos" in texto.lower():
+            requisitos = "Incluye requisitos (ver link)"
+
+        return {
+            "sueldo": sueldo,
+            "empresa": empresa,
+            "ubicacion": ubicacion,
+            "jornada": jornada,
+            "requisitos": requisitos
+        }
+
+    except Exception as e:
+        logging.error(f"Error extrayendo info: {e}")
+        return {
+            "sueldo": "No disponible",
+            "empresa": "No disponible",
+            "ubicacion": "Osorno",
+            "jornada": "No disponible",
+            "requisitos": "No disponible"
+        }
+
+# ================= NOTIFICACIONES =================
 def enviar_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -47,24 +132,20 @@ def enviar_telegram(msg):
             "chat_id": TELEGRAM_CHAT_ID,
             "text": msg
         }, timeout=10)
-        logging.info("Telegram OK")
     except Exception as e:
         logging.error(f"Telegram error: {e}")
 
-# ================= WHATSAPP =================
 def enviar_whatsapp(msg):
     try:
         if not WHATSAPP_TOKEN:
             return
 
         url = f"https://api.ultramsg.com/{WHATSAPP_INSTANCE}/messages/chat"
-        payload = {
+        requests.post(url, data={
             "token": WHATSAPP_TOKEN,
             "to": WHATSAPP_PHONE,
             "body": msg
-        }
-        requests.post(url, data=payload, timeout=10)
-        logging.info("WhatsApp OK")
+        }, timeout=10)
     except Exception as e:
         logging.error(f"WhatsApp error: {e}")
 
@@ -73,13 +154,10 @@ def enviar(msg):
     enviar_whatsapp(msg)
 
 # ================= SCRAPERS =================
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-
 def chiletrabajos():
     lista = []
     try:
-        url = "https://www.chiletrabajos.cl/busqueda?2=Osorno"
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get("https://www.chiletrabajos.cl/busqueda?2=Osorno", timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
         for a in soup.select("a"):
@@ -87,6 +165,8 @@ def chiletrabajos():
             link = a.get("href")
 
             if titulo and link and "trabajo" in link:
+                if not link.startswith("http"):
+                    link = "https://www.chiletrabajos.cl" + link
                 lista.append((titulo, link, "Chiletrabajos"))
     except:
         pass
@@ -95,15 +175,16 @@ def chiletrabajos():
 def computrabajo():
     lista = []
     try:
-        url = "https://cl.computrabajo.com/trabajo-de-osorno"
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get("https://cl.computrabajo.com/trabajo-de-osorno", timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
         for a in soup.select("a.js-o-link"):
             titulo = a.get_text(strip=True)
-            link = "https://cl.computrabajo.com" + a.get("href")
+            link = a.get("href")
 
-            if titulo:
+            if titulo and link:
+                if not link.startswith("http"):
+                    link = "https://cl.computrabajo.com" + link
                 lista.append((titulo, link, "Computrabajo"))
     except:
         pass
@@ -112,8 +193,7 @@ def computrabajo():
 def yapo():
     lista = []
     try:
-        url = "https://www.yapo.cl/region_de_los_lagos/empleos?ca=12_s&l=0&q=osorno"
-        r = requests.get(url, headers=HEADERS, timeout=10)
+        r = requests.get("https://www.yapo.cl/region_de_los_lagos/empleos?ca=12_s&l=0&q=osorno", timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
         for a in soup.select("a"):
@@ -121,19 +201,9 @@ def yapo():
             link = a.get("href")
 
             if titulo and link and "empleos" in link:
+                if not link.startswith("http"):
+                    link = "https://www.yapo.cl" + link
                 lista.append((titulo, link, "Yapo"))
-    except:
-        pass
-    return lista
-
-def facebook():
-    lista = []
-    try:
-        url = "https://www.facebook.com/search/posts/?q=trabajo%20osorno"
-        r = requests.get(url, headers=HEADERS, timeout=10)
-
-        if "trabajo" in r.text.lower():
-            lista.append(("Publicaciones trabajo en Facebook", url, "Facebook"))
     except:
         pass
     return lista
@@ -143,19 +213,18 @@ def main():
     enviados = cargar_enviados()
 
     while True:
-        logging.info("Buscando trabajos...")
-
         trabajos = []
         trabajos += chiletrabajos()
         trabajos += computrabajo()
         trabajos += yapo()
-        trabajos += facebook()
-
-        logging.info(f"Total encontrados: {len(trabajos)}")
-
-        nuevos = 0
 
         for titulo, link, fuente in trabajos:
+
+            if not titulo_valido(titulo):
+                continue
+
+            if not link_valido(link):
+                continue
 
             if not es_reciente(titulo):
                 continue
@@ -165,22 +234,26 @@ def main():
             if clave in enviados:
                 continue
 
-            msg = f"""💼 NUEVO TRABAJO
+            info = extraer_info(link)
+
+            msg = f"""💼 NUEVA OFERTA
 
 📌 {titulo}
-🌐 {fuente}
+🏢 Empresa: {info['empresa']}
+📍 Ubicación: {info['ubicacion']}
+💰 Sueldo: {info['sueldo']}
+⏰ Jornada: {info['jornada']}
+📋 {info['requisitos']}
+
+🌐 Fuente: {fuente}
 🔗 {link}
-📍 Osorno
 """
 
             enviar(msg)
 
             enviados.add(clave)
-            nuevos += 1
 
         guardar_enviados(enviados)
-
-        logging.info(f"Nuevos enviados: {nuevos}")
 
         time.sleep(INTERVALO)
 
