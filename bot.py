@@ -1,256 +1,188 @@
 import requests
 from bs4 import BeautifulSoup
 import time
-import hashlib
 import os
 import json
+import logging
+from datetime import datetime
 
 # ================= CONFIG =================
-CIUDAD = "Osorno"
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# WhatsApp (opcional)
-ULTRAMSG_TOKEN = os.getenv("ULTRAMSG_TOKEN")
-ULTRAMSG_INSTANCE = os.getenv("ULTRAMSG_INSTANCE")
-WHATSAPP_TO = os.getenv("WHATSAPP_TO")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_INSTANCE = os.getenv("WHATSAPP_INSTANCE")
+WHATSAPP_PHONE = os.getenv("WHATSAPP_PHONE")
 
-HEADERS = {"User-Agent": "Mozilla/5.0"}
-ARCHIVO = "vistos.json"
+INTERVALO = 600
 
-# ================= UTIL =================
-def cargar_vistos():
-    if os.path.exists(ARCHIVO):
-        with open(ARCHIVO, "r") as f:
+logging.basicConfig(level=logging.INFO)
+
+# ================= ARCHIVOS =================
+ENVIADOS_FILE = "enviados.json"
+
+def cargar_enviados():
+    if os.path.exists(ENVIADOS_FILE):
+        with open(ENVIADOS_FILE, "r") as f:
             return set(json.load(f))
     return set()
 
-def guardar_vistos(vistos):
-    with open(ARCHIVO, "w") as f:
-        json.dump(list(vistos), f)
+def guardar_enviados(data):
+    with open(ENVIADOS_FILE, "w") as f:
+        json.dump(list(data), f)
 
+# ================= UTIL =================
 def hash_item(texto):
-    return hashlib.md5(texto.encode()).hexdigest()
+    return str(hash(texto))
 
-# ================= MENSAJE =================
-def formatear(titulo, link, fuente):
-    return f"""🔥 NUEVA OFERTA
-
-📌 {titulo}
-
-🌐 Fuente: {fuente}
-🔗 {link}
-"""
+def es_reciente(texto):
+    texto = texto.lower()
+    return any(x in texto for x in ["hoy", "ayer", "justo ahora", "reciente"])
 
 # ================= TELEGRAM =================
 def enviar_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
-
-        print("Telegram:", r.status_code, r.text)
-
-        return r.status_code == 200
+        requests.post(url, data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg
+        }, timeout=10)
+        logging.info("Telegram OK")
     except Exception as e:
-        print("Error Telegram:", e)
-        return False
+        logging.error(f"Telegram error: {e}")
 
 # ================= WHATSAPP =================
 def enviar_whatsapp(msg):
     try:
-        if not ULTRAMSG_TOKEN:
-            return False
+        if not WHATSAPP_TOKEN:
+            return
 
-        url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat"
-        data = {
-            "token": ULTRAMSG_TOKEN,
-            "to": WHATSAPP_TO,
+        url = f"https://api.ultramsg.com/{WHATSAPP_INSTANCE}/messages/chat"
+        payload = {
+            "token": WHATSAPP_TOKEN,
+            "to": WHATSAPP_PHONE,
             "body": msg
         }
-
-        r = requests.post(url, data=data)
-        print("WhatsApp:", r.status_code)
-
-        return r.status_code == 200
-
+        requests.post(url, data=payload, timeout=10)
+        logging.info("WhatsApp OK")
     except Exception as e:
-        print("Error WhatsApp:", e)
-        return False
+        logging.error(f"WhatsApp error: {e}")
 
-# ================= SISTEMA ANTI-FALLOS =================
-def enviar_notificacion(msg):
-    print("📤 Enviando...")
+def enviar(msg):
+    enviar_telegram(msg)
+    enviar_whatsapp(msg)
 
-    ok_tel = enviar_telegram(msg)
+# ================= SCRAPERS =================
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-    if not ok_tel:
-        print("⚠️ Telegram falló, reintentando...")
-        time.sleep(5)
-        ok_tel = enviar_telegram(msg)
-
-    ok_wsp = enviar_whatsapp(msg)
-
-    if ok_wsp:
-        print("✅ WhatsApp OK")
-    else:
-        print("⚠️ WhatsApp no disponible (no crítico)")
-
-# ================= FUENTES =================
-
-def fuente_indeed():
-    jobs = []
+def chiletrabajos():
+    lista = []
     try:
-        url = "https://cl.indeed.com/jobs?q=&l=Osorno"
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for job in soup.select("a.tapItem"):
-            titulo = job.get_text(strip=True)
-            link = "https://cl.indeed.com" + job.get("href")
-            jobs.append((titulo, link, "Indeed"))
-    except Exception as e:
-        print("Indeed error:", e)
-
-    print("Indeed:", len(jobs))
-    return jobs
-
-
-def fuente_yapo():
-    jobs = []
-    try:
-        url = "https://www.yapo.cl/region_de_los_lagos/empleos"
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for item in soup.select("a"):
-            titulo = item.get_text(strip=True)
-            link = item.get("href")
-
-            if link and "yapo.cl" in link:
-                jobs.append((titulo, link, "Yapo"))
-    except Exception as e:
-        print("Yapo error:", e)
-
-    print("Yapo:", len(jobs))
-    return jobs
-
-
-def fuente_google():
-    jobs = []
-    try:
-        url = "https://www.google.com/search?q=empleos+en+Osorno"
-        r = requests.get(url, headers=HEADERS)
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        for g in soup.select("a"):
-            titulo = g.get_text(strip=True)
-            link = g.get("href")
-
-            if titulo and "http" in str(link):
-                jobs.append((titulo, link, "Google"))
-    except Exception as e:
-        print("Google error:", e)
-
-    print("Google:", len(jobs))
-    return jobs
-
-
-def fuente_facebook():
-    jobs = []
-    try:
-        url = "https://www.google.com/search?q=trabajo+osorno+facebook"
-        r = requests.get(url, headers=HEADERS)
+        url = "https://www.chiletrabajos.cl/busqueda?2=Osorno"
+        r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
         for a in soup.select("a"):
-            link = a.get("href")
             titulo = a.get_text(strip=True)
+            link = a.get("href")
 
-            if "facebook.com" in str(link):
-                jobs.append((titulo, link, "Facebook"))
-    except Exception as e:
-        print("Facebook error:", e)
+            if titulo and link and "trabajo" in link:
+                lista.append((titulo, link, "Chiletrabajos"))
+    except:
+        pass
+    return lista
 
-    print("Facebook:", len(jobs))
-    return jobs
-
-
-def fuente_computrabajo():
-    jobs = []
+def computrabajo():
+    lista = []
     try:
-        url = "https://www.computrabajo.cl/trabajo-de-osorno"
-        r = requests.get(url, headers=HEADERS)
+        url = "https://cl.computrabajo.com/trabajo-de-osorno"
+        r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for item in soup.select("article"):
-            tag = item.select_one("h2 a")
-            if tag:
-                titulo = tag.get_text(strip=True)
-                link = "https://www.computrabajo.cl" + tag.get("href")
-                jobs.append((titulo, link, "Computrabajo"))
-    except Exception as e:
-        print("Computrabajo error:", e)
+        for a in soup.select("a.js-o-link"):
+            titulo = a.get_text(strip=True)
+            link = "https://cl.computrabajo.com" + a.get("href")
 
-    print("Computrabajo:", len(jobs))
-    return jobs
+            if titulo:
+                lista.append((titulo, link, "Computrabajo"))
+    except:
+        pass
+    return lista
 
-
-def fuente_chiletrabajos():
-    jobs = []
+def yapo():
+    lista = []
     try:
-        url = "https://www.chiletrabajos.cl/busqueda/?q=osorno"
-        r = requests.get(url, headers=HEADERS)
+        url = "https://www.yapo.cl/region_de_los_lagos/empleos?ca=12_s&l=0&q=osorno"
+        r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for item in soup.select("a"):
-            titulo = item.get_text(strip=True)
-            link = item.get("href")
+        for a in soup.select("a"):
+            titulo = a.get_text(strip=True)
+            link = a.get("href")
 
-            if link and "/oferta/" in str(link):
-                jobs.append((titulo, link, "Chiletrabajos"))
-    except Exception as e:
-        print("Chiletrabajos error:", e)
+            if titulo and link and "empleos" in link:
+                lista.append((titulo, link, "Yapo"))
+    except:
+        pass
+    return lista
 
-    print("Chiletrabajos:", len(jobs))
-    return jobs
-
-
-# ================= MAIN =================
-vistos = cargar_vistos()
-
-while True:
+def facebook():
+    lista = []
     try:
-        print("\n🔎 Buscando trabajos...")
+        url = "https://www.facebook.com/search/posts/?q=trabajo%20osorno"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+
+        if "trabajo" in r.text.lower():
+            lista.append(("Publicaciones trabajo en Facebook", url, "Facebook"))
+    except:
+        pass
+    return lista
+
+# ================= LOOP =================
+def main():
+    enviados = cargar_enviados()
+
+    while True:
+        logging.info("Buscando trabajos...")
 
         trabajos = []
-        trabajos += fuente_indeed()
-        trabajos += fuente_yapo()
-        trabajos += fuente_google()
-        trabajos += fuente_facebook()
-        trabajos += fuente_computrabajo()
-        trabajos += fuente_chiletrabajos()
+        trabajos += chiletrabajos()
+        trabajos += computrabajo()
+        trabajos += yapo()
+        trabajos += facebook()
 
-        print("TOTAL:", len(trabajos))
+        logging.info(f"Total encontrados: {len(trabajos)}")
 
         nuevos = 0
 
         for titulo, link, fuente in trabajos:
+
+            if not es_reciente(titulo):
+                continue
+
             clave = hash_item(link)
 
-            if clave not in vistos:
-                msg = formatear(titulo, link, fuente)
+            if clave in enviados:
+                continue
 
-                enviar_notificacion(msg)
+            msg = f"""💼 NUEVO TRABAJO
 
-                vistos.add(clave)
-                guardar_vistos(vistos)
+📌 {titulo}
+🌐 {fuente}
+🔗 {link}
+📍 Osorno
+"""
 
-                nuevos += 1
+            enviar(msg)
 
-        print("📩 Nuevos enviados:", nuevos)
+            enviados.add(clave)
+            nuevos += 1
 
-    except Exception as e:
-        print("ERROR GENERAL:", e)
+        guardar_enviados(enviados)
 
-    time.sleep(180)
+        logging.info(f"Nuevos enviados: {nuevos}")
+
+        time.sleep(INTERVALO)
+
+if __name__ == "__main__":
+    main()
