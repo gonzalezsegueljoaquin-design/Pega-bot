@@ -4,68 +4,39 @@ import time
 import logging
 import os
 import re
-from datetime import datetime
 
 # ==============================
 # ⚙️ CONFIG
 # ==============================
-BUSQUEDA = "trabajo osorno"
-INTERVALO = 600  # 10 minutos
+BUSQUEDA = "empleos osorno chile"
+INTERVALO = 600
 ENVIADOS_FILE = "enviados.txt"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
-WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
-WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
-WHATSAPP_TO = os.getenv("WHATSAPP_TO")
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0"
 }
 
 # ==============================
-# 🧠 LOGS MODO DIOS
+# LOGS
 # ==============================
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ==============================
-# 📦 UTILIDADES
+# UTILIDADES
 # ==============================
 def limpiar(texto):
     return re.sub(r"\s+", " ", texto).strip()
 
-def es_link_valido(link):
-    if not link:
-        return False
-    if "google" in link and "http" not in link:
-        return False
-    return True
-
-# ==============================
-# 🧠 FILTRO INTELIGENTE (NO AGRESIVO)
-# ==============================
-def es_reciente(texto):
+def es_basura(texto):
     texto = texto.lower()
-
-    if "hoy" in texto or "ayer" in texto:
-        return True
-
-    if "hora" in texto:
-        return True
-
-    match = re.search(r"(\d+)\s*d[ií]a", texto)
-    if match:
-        dias = int(match.group(1))
-        return dias <= 2
-
-    return True  # 🔥 no perder ofertas
+    basura = ["términos", "privacidad", "login", "registr", "contacto", "cookies"]
+    return any(p in texto for p in basura)
 
 # ==============================
-# 📂 CONTROL DUPLICADOS
+# DUPLICADOS
 # ==============================
 def cargar_enviados():
     try:
@@ -79,9 +50,9 @@ def guardar_enviado(link):
         f.write(link + "\n")
 
 # ==============================
-# 📤 TELEGRAM
+# TELEGRAM
 # ==============================
-def enviar_telegram(msg):
+def enviar(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logging.error("Faltan variables de Telegram")
         return
@@ -89,109 +60,105 @@ def enviar_telegram(msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
-        r = requests.post(url, data={
+        requests.post(url, data={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": msg
         })
-        logging.info(f"Telegram status: {r.status_code}")
     except Exception as e:
         logging.error(f"Error Telegram: {e}")
 
 # ==============================
-# 📤 WHATSAPP (META API)
-# ==============================
-def enviar_whatsapp(msg):
-    if not WHATSAPP_TOKEN or not WHATSAPP_PHONE_ID or not WHATSAPP_TO:
-        logging.info("WhatsApp no configurado (se omite)")
-        return
-
-    url = f"https://graph.facebook.com/v18.0/{WHATSAPP_PHONE_ID}/messages"
-
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
-
-    data = {
-        "messaging_product": "whatsapp",
-        "to": WHATSAPP_TO,
-        "type": "text",
-        "text": {"body": msg}
-    }
-
-    try:
-        r = requests.post(url, headers=headers, json=data)
-        logging.info(f"WhatsApp status: {r.status_code}")
-    except Exception as e:
-        logging.error(f"Error WhatsApp: {e}")
-
-# ==============================
-# 📤 ENVÍO GENERAL
-# ==============================
-def enviar(msg):
-    enviar_telegram(msg)
-    enviar_whatsapp(msg)
-
-# ==============================
-# 🧠 EXTRAER INFO (BÁSICO PERO ÚTIL)
+# EXTRAER INFO
 # ==============================
 def extraer_info(texto):
-    texto_lower = texto.lower()
-
     sueldo = "No especificado"
     empresa = "No especificada"
-    ubicacion = "Osorno"
 
-    # sueldo simple
     match = re.search(r"\$[\d\.\,]+", texto)
     if match:
         sueldo = match.group(0)
 
-    # empresa heurística
-    if "empresa" in texto_lower:
-        empresa = "Mencionada en aviso"
+    if "empresa" in texto.lower():
+        empresa = "Indicada en aviso"
 
-    return empresa, sueldo, ubicacion
+    return empresa, sueldo
 
 # ==============================
-# 🔎 SCRAP GOOGLE JOBS (MEJORADO)
+# SCRAPERS REALES
 # ==============================
-def buscar_google():
+
+# 🟢 CHILETRABAJOS
+def buscar_chiletrabajos():
     trabajos = []
-    url = f"https://www.google.com/search?q={BUSQUEDA.replace(' ', '+')}"
+    url = "https://www.chiletrabajos.cl/trabajo/?q=osorno"
 
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        for g in soup.select("a"):
-            titulo = limpiar(g.text)
-            link = g.get("href")
+        for item in soup.select("article"):
+            titulo = limpiar(item.text)
+            link_tag = item.find("a")
 
-            if not titulo or len(titulo) < 15:
+            if not link_tag:
                 continue
 
-            if not es_link_valido(link):
+            link = link_tag.get("href")
+
+            if not titulo or len(titulo) < 15 or es_basura(titulo):
                 continue
 
             trabajos.append({
                 "titulo": titulo,
                 "link": link,
-                "fuente": "Google"
+                "fuente": "Chiletrabajos"
             })
 
     except Exception as e:
-        logging.error(f"Error Google: {e}")
+        logging.error(f"Chiletrabajos error: {e}")
 
-    logging.info(f"Google: {len(trabajos)} avisos")
+    logging.info(f"Chiletrabajos: {len(trabajos)}")
     return trabajos
 
-# ==============================
-# 🔎 YAPO (BÁSICO)
-# ==============================
-def buscar_yapo():
+
+# 🟢 COMPUTRABAJO
+def buscar_computrabajo():
     trabajos = []
-    url = "https://www.yapo.cl/region_de_los_lagos/empleos"
+    url = "https://www.computrabajo.cl/trabajo-de-osorno"
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for item in soup.select("article"):
+            titulo = limpiar(item.text)
+            link_tag = item.find("a")
+
+            if not link_tag:
+                continue
+
+            link = "https://www.computrabajo.cl" + link_tag.get("href")
+
+            if not titulo or len(titulo) < 15 or es_basura(titulo):
+                continue
+
+            trabajos.append({
+                "titulo": titulo,
+                "link": link,
+                "fuente": "Computrabajo"
+            })
+
+    except Exception as e:
+        logging.error(f"Computrabajo error: {e}")
+
+    logging.info(f"Computrabajo: {len(trabajos)}")
+    return trabajos
+
+
+# 🟢 BNE
+def buscar_bne():
+    trabajos = []
+    url = "https://www.bne.cl/ofertas?textoBusqueda=osorno"
 
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
@@ -201,101 +168,124 @@ def buscar_yapo():
             titulo = limpiar(item.text)
             link = item.get("href")
 
-            if not titulo or len(titulo) < 10:
+            if not titulo or len(titulo) < 20:
                 continue
 
-            if not link:
+            if "/oferta/" not in str(link):
                 continue
+
+            link = "https://www.bne.cl" + link
 
             trabajos.append({
                 "titulo": titulo,
-                "link": "https://www.yapo.cl" + link,
+                "link": link,
+                "fuente": "BNE"
+            })
+
+    except Exception as e:
+        logging.error(f"BNE error: {e}")
+
+    logging.info(f"BNE: {len(trabajos)}")
+    return trabajos
+
+
+# 🟡 YAPO (filtrado)
+def buscar_yapo():
+    trabajos = []
+    url = "https://www.yapo.cl/region_de_los_lagos/empleos"
+
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for item in soup.select("li"):
+            titulo = limpiar(item.text)
+            link_tag = item.find("a")
+
+            if not link_tag:
+                continue
+
+            link = link_tag.get("href")
+
+            if not titulo or len(titulo) < 20 or es_basura(titulo):
+                continue
+
+            if "/empleos" not in str(link):
+                continue
+
+            link = "https://www.yapo.cl" + link
+
+            trabajos.append({
+                "titulo": titulo,
+                "link": link,
                 "fuente": "Yapo"
             })
 
     except Exception as e:
-        logging.error(f"Error Yapo: {e}")
+        logging.error(f"Yapo error: {e}")
 
-    logging.info(f"Yapo: {len(trabajos)} avisos")
+    logging.info(f"Yapo: {len(trabajos)}")
     return trabajos
 
-# ==============================
-# 🔎 FACEBOOK (LIMITADO PERO INCLUIDO)
-# ==============================
-def buscar_facebook():
-    trabajos = []
-    # Facebook bloquea scraping → placeholder inteligente
-    logging.info("Facebook: scraping limitado (se omite automático)")
-    return trabajos
 
 # ==============================
-# 🧠 PROCESAMIENTO CENTRAL
+# PROCESAR
 # ==============================
 def procesar(trabajos, enviados):
     nuevos = 0
 
     for t in trabajos:
-        titulo = t["titulo"]
-        link = t["link"]
-
-        if link in enviados:
+        if t["link"] in enviados:
             continue
 
-        if not es_reciente(titulo):
-            continue
-
-        empresa, sueldo, ubicacion = extraer_info(titulo)
+        empresa, sueldo = extraer_info(t["titulo"])
 
         mensaje = f"""🔥 NUEVA OFERTA
 
-📌 {titulo}
+📌 {t['titulo']}
 
 🏢 Empresa: {empresa}
-📍 Lugar: {ubicacion}
 💰 Sueldo: {sueldo}
 
 🌐 Fuente: {t['fuente']}
-🔗 {link}
+🔗 {t['link']}
 """
 
         enviar(mensaje)
-        guardar_enviado(link)
+        guardar_enviado(t["link"])
         nuevos += 1
 
     return nuevos
 
+
 # ==============================
-# 🚀 MAIN LOOP
+# MAIN
 # ==============================
 def main():
-    logging.info("🚀 BOT INICIANDO (DEBUG MODO DIOS)")
-    enviar("🚀 Bot activo y monitoreando trabajos en Osorno")
+    logging.info("🚀 BOT PROFESIONAL INICIADO")
+    enviar("🚀 Bot activo buscando trabajos reales en Osorno")
 
     while True:
         try:
-            logging.info("🔎 Buscando trabajos...")
             enviados = cargar_enviados()
 
             trabajos = []
-            trabajos += buscar_google()
+            trabajos += buscar_chiletrabajos()
+            trabajos += buscar_computrabajo()
+            trabajos += buscar_bne()
             trabajos += buscar_yapo()
-            trabajos += buscar_facebook()
 
             logging.info(f"Total encontrados: {len(trabajos)}")
 
             nuevos = procesar(trabajos, enviados)
 
-            logging.info(f"📤 Nuevos enviados: {nuevos}")
-            logging.info("⏳ Esperando siguiente ciclo...\n")
+            logging.info(f"Nuevos enviados: {nuevos}")
 
         except Exception as e:
-            logging.error(f"💥 ERROR CRÍTICO: {e}")
-            enviar(f"⚠️ ERROR BOT: {e}")
+            logging.error(f"ERROR: {e}")
 
         time.sleep(INTERVALO)
 
-# ==============================
-# ▶️ START
-# ==============================
+
 if __name__ == "__main__":
     main()
