@@ -7,11 +7,11 @@ import json
 
 # ================= CONFIG =================
 CIUDAD = "Osorno"
-KEYWORDS = ["trabajo", "operario", "bodega", "reponedor", "auxiliar"]
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
+# WhatsApp (opcional)
 ULTRAMSG_TOKEN = os.getenv("ULTRAMSG_TOKEN")
 ULTRAMSG_INSTANCE = os.getenv("ULTRAMSG_INSTANCE")
 WHATSAPP_TO = os.getenv("WHATSAPP_TO")
@@ -33,10 +33,6 @@ def guardar_vistos(vistos):
 def hash_item(texto):
     return hashlib.md5(texto.encode()).hexdigest()
 
-def contiene_keyword(texto):
-    texto = texto.lower()
-    return any(k in texto for k in KEYWORDS)
-
 # ================= MENSAJE =================
 def formatear(titulo, link, fuente):
     return f"""🔥 NUEVA OFERTA
@@ -51,29 +47,61 @@ def formatear(titulo, link, fuente):
 def enviar_telegram(msg):
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+        r = requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+
+        print("Telegram:", r.status_code, r.text)
+
+        return r.status_code == 200
     except Exception as e:
         print("Error Telegram:", e)
+        return False
 
 # ================= WHATSAPP =================
 def enviar_whatsapp(msg):
     try:
+        if not ULTRAMSG_TOKEN:
+            return False
+
         url = f"https://api.ultramsg.com/{ULTRAMSG_INSTANCE}/messages/chat"
         data = {
             "token": ULTRAMSG_TOKEN,
             "to": WHATSAPP_TO,
             "body": msg
         }
-        requests.post(url, data=data)
+
+        r = requests.post(url, data=data)
+        print("WhatsApp:", r.status_code)
+
+        return r.status_code == 200
+
     except Exception as e:
         print("Error WhatsApp:", e)
+        return False
+
+# ================= SISTEMA ANTI-FALLOS =================
+def enviar_notificacion(msg):
+    print("📤 Enviando...")
+
+    ok_tel = enviar_telegram(msg)
+
+    if not ok_tel:
+        print("⚠️ Telegram falló, reintentando...")
+        time.sleep(5)
+        ok_tel = enviar_telegram(msg)
+
+    ok_wsp = enviar_whatsapp(msg)
+
+    if ok_wsp:
+        print("✅ WhatsApp OK")
+    else:
+        print("⚠️ WhatsApp no disponible (no crítico)")
 
 # ================= FUENTES =================
 
 def fuente_indeed():
     jobs = []
     try:
-        url = "https://cl.indeed.com/jobs?q=trabajo&l=Osorno"
+        url = "https://cl.indeed.com/jobs?q=&l=Osorno"
         r = requests.get(url, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
@@ -111,7 +139,7 @@ def fuente_yapo():
 def fuente_google():
     jobs = []
     try:
-        url = "https://www.google.com/search?q=trabajos+osorno"
+        url = "https://www.google.com/search?q=empleos+en+Osorno"
         r = requests.get(url, headers=HEADERS)
         soup = BeautifulSoup(r.text, "html.parser")
 
@@ -188,27 +216,6 @@ def fuente_chiletrabajos():
     return jobs
 
 
-# ================= MOTOR =================
-def obtener_trabajos():
-    trabajos = []
-    trabajos += fuente_indeed()
-    trabajos += fuente_yapo()
-    trabajos += fuente_google()
-    trabajos += fuente_facebook()
-    trabajos += fuente_computrabajo()
-    trabajos += fuente_chiletrabajos()
-
-    print("TOTAL bruto:", len(trabajos))
-
-    filtrados = []
-    for t, l, f in trabajos:
-        if contiene_keyword(t) and CIUDAD.lower() in t.lower():
-            filtrados.append((t, l, f))
-
-    print("TOTAL filtrado:", len(filtrados))
-    return filtrados
-
-
 # ================= MAIN =================
 vistos = cargar_vistos()
 
@@ -216,7 +223,16 @@ while True:
     try:
         print("\n🔎 Buscando trabajos...")
 
-        trabajos = obtener_trabajos()
+        trabajos = []
+        trabajos += fuente_indeed()
+        trabajos += fuente_yapo()
+        trabajos += fuente_google()
+        trabajos += fuente_facebook()
+        trabajos += fuente_computrabajo()
+        trabajos += fuente_chiletrabajos()
+
+        print("TOTAL:", len(trabajos))
+
         nuevos = 0
 
         for titulo, link, fuente in trabajos:
@@ -225,8 +241,7 @@ while True:
             if clave not in vistos:
                 msg = formatear(titulo, link, fuente)
 
-                enviar_telegram(msg)
-                enviar_whatsapp(msg)
+                enviar_notificacion(msg)
 
                 vistos.add(clave)
                 guardar_vistos(vistos)
