@@ -1,13 +1,6 @@
 """
-Bot de empleos Osorno — URLs y selectores verificados en abril 2026
-Fuentes:
-  - Chiletrabajos : https://www.chiletrabajos.cl/ciudad/osorno.html
-  - Computrabajo  : https://cl.computrabajo.com/empleos-en-los-lagos-en-osorno
-  - Indeed        : https://cl.indeed.com/l-osorno,-los-lagos-empleos.html
-  (BNE descartada: requiere JS para renderizar resultados)
-
-Deduplicación doble: por URL + por hash(título+empresa)
-Polling cada 30 s para detectar ofertas nuevas casi en tiempo real.
+Bot de empleos Osorno
+Selectores basados en HTML real inspeccionado de cada sitio.
 """
 
 import requests
@@ -21,15 +14,15 @@ import hashlib
 from dataclasses import dataclass
 from typing import Optional
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 # CONFIG
-# ──────────────────────────────────────────
-INTERVALO      = 30      # segundos entre ciclos
-MAX_REGISTROS  = 3000
-TIMEOUT        = 15
-DELAY_FETCH    = 2.0     # pausa entre cada página de detalle
-MAX_DESC       = 700
-MAX_REQ        = 450
+# ──────────────────────────────────────────────────────
+INTERVALO     = 30       # segundos entre ciclos de búsqueda
+MAX_REGISTROS = 3000
+TIMEOUT       = 15
+DELAY_FETCH   = 2.0      # pausa entre fetches de detalle
+MAX_DESC      = 700
+MAX_REQ       = 500
 
 STATE_FILE = "estado_bot.json"
 LOG_FILE   = "bot_empleos.log"
@@ -58,9 +51,9 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 # MODELO
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 @dataclass
 class Oferta:
     titulo:      str
@@ -75,9 +68,9 @@ class Oferta:
     postulado:   bool = False
 
 
-# ──────────────────────────────────────────
-# ESTADO PERSISTENTE
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# ESTADO PERSISTENTE (doble índice: URL + hash contenido)
+# ──────────────────────────────────────────────────────
 class Estado:
     def __init__(self):
         self.urls:    set = set()
@@ -90,9 +83,9 @@ class Estado:
                 d = json.load(f)
             self.urls    = set(d.get("urls", []))
             self.huellas = set(d.get("huellas", []))
-            log.info(f"Estado: {len(self.urls)} URLs, {len(self.huellas)} huellas")
+            log.info(f"Estado cargado: {len(self.urls)} URLs, {len(self.huellas)} huellas")
         except FileNotFoundError:
-            log.info("Estado nuevo — sin historial previo")
+            log.info("Sin historial previo — empezando desde cero")
         except Exception as e:
             log.warning(f"Error cargando estado: {e}")
 
@@ -103,20 +96,17 @@ class Estado:
         self.huellas = set(huellas)
         try:
             with open(STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump({"urls": urls, "huellas": huellas}, f,
-                          ensure_ascii=False, indent=2)
+                json.dump({"urls": urls, "huellas": huellas}, f, ensure_ascii=False, indent=2)
         except Exception as e:
             log.error(f"Error guardando estado: {e}")
 
     @staticmethod
     def _huella(titulo: str, empresa: str) -> str:
-        txt = re.sub(r"\s+", " ", (titulo + empresa).lower().strip())
+        txt = re.sub(r"\s+", " ", (titulo + "|" + empresa).lower().strip())
         return hashlib.md5(txt.encode()).hexdigest()
 
     def ya_enviado(self, o: Oferta) -> bool:
-        if o.link in self.urls:
-            return True
-        return self._huella(o.titulo, o.empresa) in self.huellas
+        return o.link in self.urls or self._huella(o.titulo, o.empresa) in self.huellas
 
     def registrar(self, o: Oferta):
         self.urls.add(o.link)
@@ -124,24 +114,24 @@ class Estado:
         self._guardar()
 
     def marcar_url(self, url: str):
-        """Marca sólo la URL (sin contenido) para no volver a visitarla."""
         self.urls.add(url)
         self._guardar()
 
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 # UTILIDADES
-# ──────────────────────────────────────────
-def limpiar(t: str) -> str:
+# ──────────────────────────────────────────────────────
+def L(t) -> str:
+    """Limpia espacios."""
     return re.sub(r"\s+", " ", (t or "")).strip()
 
 def truncar(t: str, n: int) -> str:
-    t = limpiar(t)
+    t = L(t)
     return t[:n] + "…" if len(t) > n else t
 
 def abs_url(href: str, base: str) -> str:
     href = (href or "").strip()
-    if not href or href.startswith("#"):
+    if not href or href.startswith("#") or href.startswith("javascript"):
         return ""
     return href if href.startswith("http") else base.rstrip("/") + "/" + href.lstrip("/")
 
@@ -156,67 +146,45 @@ def get_soup(url: str, reintentos: int = 2) -> Optional[BeautifulSoup]:
             time.sleep(DELAY_FETCH * i)
     return None
 
-def primer_texto(soup: BeautifulSoup, *sels) -> str:
-    for sel in sels:
-        try:
-            el = soup.select_one(sel)
-            if el:
-                t = limpiar(el.get_text(separator=" "))
-                if t:
-                    return t
-        except Exception:
-            continue
-    return ""
-
-def buscar_sueldo_regex(texto: str) -> str:
+def regex_sueldo(texto: str) -> str:
     m = re.search(r"\$\s*[\d\.\,]+(?:\s*[-–]\s*\$?\s*[\d\.\,]+)?", texto)
-    return limpiar(m.group(0)) if m else ""
+    return L(m.group(0)) if m else ""
 
-def detectar_jornada(texto: str) -> str:
-    t = texto.lower()
-    if "part.?time" in t or "jornada parcial" in t:  return "Part Time"
-    if "full.?time" in t or "jornada completa" in t: return "Full Time"
-    return ""
-
-def buscar_fecha_regex(texto: str) -> str:
-    patrones = [
+def regex_fecha(texto: str) -> str:
+    for p in [
         r"hace\s+\d+\s+(?:minuto|minutos|hora|horas|día|días|semana|semanas)",
         r"\d{1,2}\s+de\s+\w+\s+de\s+\d{4}",
         r"\d{4}-\d{2}-\d{2}",
         r"\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}",
-        r"(?:publicado|publicada)[^\n]{0,30}(?:\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{4}-\d{2}-\d{2})",
-        r"(?:hoy|ayer|anteayer)",
-    ]
-    for p in patrones:
+        r"(?:hoy|ayer)",
+    ]:
         m = re.search(p, texto, re.I)
         if m:
-            return limpiar(m.group(0))
+            return L(m.group(0))
     return ""
 
-def detectar_postulado(soup: BeautifulSoup) -> bool:
+def jornada_texto(texto: str) -> str:
+    t = texto.lower()
+    if re.search(r"part.?time|jornada parcial", t): return "Part Time"
+    if re.search(r"full.?time|jornada completa",  t): return "Full Time"
+    return ""
+
+def tabla_valor(soup: BeautifulSoup, clave: str) -> str:
     """
-    Detecta si el usuario ya postuló a esta oferta.
-    Chiletrabajos muestra "Ya postulaste" o el botón cambia a "Postulado".
-    Computrabajo muestra "Ya aplicaste" o similar.
+    En Chiletrabajos, los datos están en una tabla de dos columnas:
+    <td>Clave</td><td>Valor</td>
     """
-    texto = soup.get_text(" ", strip=True).lower()
-    indicadores = [
-        "ya postulaste", "ya postulado", "postulado",
-        "ya aplicaste", "aplicaste", "postulación enviada",
-        "ya te inscribiste", "inscrito",
-    ]
-    # También buscar en atributos de botones
-    for btn in soup.select("a, button, span"):
-        txt = limpiar(btn.get_text()).lower()
-        clase = " ".join(btn.get("class", [])).lower()
-        if any(ind in txt or ind in clase for ind in indicadores):
-            return True
-    return any(ind in texto for ind in indicadores)
+    for td in soup.select("table td"):
+        if clave.lower() in td.get_text().lower():
+            sig = td.find_next_sibling("td")
+            if sig:
+                return L(sig.get_text(separator=" "))
+    return ""
 
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 # TELEGRAM
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 def enviar(msg: str, reintentos: int = 3) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("Faltan TELEGRAM_TOKEN / TELEGRAM_CHAT_ID")
@@ -238,10 +206,26 @@ def enviar(msg: str, reintentos: int = 3) -> bool:
     return False
 
 
-# ──────────────────────────────────────────
-# SCRAPER: CHILETRABAJOS
-# URL verificada: https://www.chiletrabajos.cl/ciudad/osorno.html
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# CHILETRABAJOS
+# Listado: https://www.chiletrabajos.cl/ciudad/osorno.html
+#
+# HTML real del detalle:
+#   <table>
+#     <tr><td>ID</td>     <td>3812588</td></tr>
+#     <tr><td>Buscado</td><td>Valor & Talento</td></tr>
+#     <tr><td>Fecha</td>  <td>2026-03-31 16:13:45</td></tr>
+#     <tr><td>Salario</td><td>1.300.000</td></tr>
+#     <tr><td>Tipo</td>   <td>Full-time</td></tr>
+#   </table>
+#   <h1>Jefe de Laboratorio</h1>
+#   <h3>Descripción oferta de trabajo</h3>
+#   <p>...descripción... Requisitos: - ...</p>
+#
+#   Botón postular: <a href="/trabajo/postular/3812588">Postular</a>
+#   Si ya postulaste: el texto del botón cambia a "Postulado" o aparece
+#   una clase CSS "postulado" en el enlace.
+# ──────────────────────────────────────────────────────
 BASE_CHT = "https://www.chiletrabajos.cl"
 
 def listar_chiletrabajos() -> list:
@@ -251,143 +235,154 @@ def listar_chiletrabajos() -> list:
         return []
 
     resultado = []
-    # Cada oferta es un <article> o un bloque con enlace al trabajo
-    for a in soup.select("a[href*='/trabajo/']"):
+    # Los enlaces de oferta siguen el patrón /trabajo/nombre-oferta-NNNNNNN
+    # Excluir: /postular/, /relacionadas/, ?utm_, /ciudad/, /trabajos/
+    patron = re.compile(r"^/trabajo/[^/]+-\d+$")
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        # Filtrar enlaces de navegación (relacionadas, postular, etc.)
-        if any(x in href for x in ["/postular/", "/relacionadas/", "utm_"]):
+        if not patron.match(href):
             continue
-        link = abs_url(href, BASE_CHT)
-        if not link:
-            continue
-        # Título: texto del enlace o del h2 más cercano
-        titulo = limpiar(a.get_text(separator=" "))
-        if len(titulo) < 5:
-            parent = a.find_parent(["article", "div", "li"])
-            if parent:
-                h = parent.find(["h2", "h3", "h1"])
+        link = BASE_CHT + href
+        # Título: texto del enlace o del heading padre
+        titulo = L(a.get_text(separator=" "))
+        if len(titulo) < 4:
+            for anc in a.parents:
+                h = anc.find(["h2", "h3", "h1"])
                 if h:
-                    titulo = limpiar(h.get_text())
-        if len(titulo) < 5:
+                    titulo = L(h.get_text())
+                    break
+        if len(titulo) < 4:
             continue
         resultado.append({"titulo": titulo, "link": link, "fuente": "Chiletrabajos"})
 
-    # Deduplicar por link dentro del listado
-    vistos = set()
-    unicos = []
+    # Deduplicar
+    seen, unicos = set(), []
     for t in resultado:
-        if t["link"] not in vistos:
-            vistos.add(t["link"])
+        if t["link"] not in seen:
+            seen.add(t["link"])
             unicos.append(t)
-
-    log.info(f"Chiletrabajos: {len(unicos)} ofertas en listado")
+    log.info(f"Chiletrabajos: {len(unicos)} en listado")
     return unicos
 
+
 def detalle_chiletrabajos(link: str) -> dict:
-    """
-    Estructura real de chiletrabajos.cl/trabajo/xxx:
-      - Tabla con: ID, empresa (Buscado), Fecha, Tipo (Full/Part)
-      - h1 = título
-      - .descripcion-oferta o sección "Descripción oferta de trabajo"
-    """
     soup = get_soup(link)
     if not soup:
         return {}
 
-    texto_pagina = soup.get_text(" ", strip=True)
+    # ── Título ──
+    titulo = L(soup.find("h1").get_text()) if soup.find("h1") else ""
 
-    # Título
-    titulo = primer_texto(soup, "h1")
+    # ── Datos de la tabla ──
+    empresa = tabla_valor(soup, "buscado")
+    fecha   = tabla_valor(soup, "fecha")
+    if fecha:
+        # Quedarnos sólo con la parte de fecha (sin hora)
+        m = re.match(r"(\d{4}-\d{2}-\d{2})", fecha)
+        fecha = m.group(1) if m else fecha
 
-    # Empresa: en la tabla aparece como "Buscado" → td siguiente
-    empresa = ""
-    for td in soup.select("table td"):
-        if "buscado" in td.get_text().lower():
-            sig = td.find_next_sibling("td")
-            if sig:
-                empresa = limpiar(sig.get_text())
-            break
-    if not empresa:
-        empresa = primer_texto(soup, ".company-name", "[class*='empresa']", "[itemprop='name']")
+    sueldo  = tabla_valor(soup, "salario")
+    if sueldo:
+        # Formatear: "1.300.000" → "$1.300.000"
+        sueldo = sueldo.strip()
+        if sueldo and not sueldo.startswith("$"):
+            sueldo = "$" + sueldo
+    else:
+        sueldo = regex_sueldo(soup.get_text())
 
-    # Fecha: en la tabla y también como "Publicado: ayer / DD de mes YYYY"
-    fecha = ""
-    for td in soup.select("table td"):
-        txt = td.get_text()
-        if re.search(r"\d{4}-\d{2}-\d{2}", txt):
-            m = re.search(r"\d{4}-\d{2}-\d{2}", txt)
-            fecha = m.group(0)
-            break
-    if not fecha:
-        fecha = buscar_fecha_regex(texto_pagina)
+    jornada = tabla_valor(soup, "tipo")
+    if not jornada:
+        jornada = jornada_texto(soup.get_text())
 
-    # Tipo de jornada: en la tabla como "Full-time" / "Part-time"
-    jornada = detectar_jornada(texto_pagina)
-    for td in soup.select("table td"):
-        txt = td.get_text().lower()
-        if "full" in txt and "time" in txt:
-            jornada = "Full Time"; break
-        if "part" in txt and "time" in txt:
-            jornada = "Part Time"; break
-
-    # Sueldo
-    sueldo = primer_texto(soup, "[class*='salary']", "[class*='sueldo']", ".sueldo")
-    if not sueldo:
-        sueldo = buscar_sueldo_regex(texto_pagina)
-
-    # Descripción: la sección después del h3 "Descripción oferta de trabajo"
+    # ── Descripción y Requisitos ──
+    # El bloque de texto principal viene después de la tabla.
+    # Patrón real: todo el texto está en párrafos/divs después del h3 "Descripción oferta de trabajo"
     descripcion = ""
-    for h3 in soup.find_all(["h3", "h2", "strong"]):
-        if "descripci" in h3.get_text().lower():
-            sib = h3.find_next_sibling()
+    requisitos  = ""
+
+    # Buscar el bloque de texto que contiene la descripción
+    bloque_texto = ""
+    for tag in soup.find_all(["h2", "h3", "h4", "strong", "b"]):
+        txt_tag = tag.get_text(strip=True).lower()
+        if "descripci" in txt_tag and "oferta" in txt_tag:
+            # Recoger todos los siblings de texto hasta el próximo h2/h3 de nivel similar
             partes = []
-            while sib and len(partes) < 8:
-                t = limpiar(sib.get_text(separator=" "))
+            for sib in tag.next_siblings:
+                if hasattr(sib, "name") and sib.name in ["h2", "h3"] and sib.name == tag.name:
+                    break
+                t = L(sib.get_text(separator=" ")) if hasattr(sib, "get_text") else L(str(sib))
                 if t:
                     partes.append(t)
-                sib = sib.find_next_sibling()
-            descripcion = " ".join(partes)
+            bloque_texto = " ".join(partes)
             break
+
+    if not bloque_texto:
+        # Fallback: buscar el <article> o div principal
+        for sel in ["article", ".main-content", ".oferta-content", "#oferta", "main"]:
+            el = soup.select_one(sel)
+            if el:
+                bloque_texto = L(el.get_text(separator=" "))
+                break
+
+    if bloque_texto:
+        # Separar descripción de requisitos usando el patrón "Requisitos:"
+        split_patterns = [
+            r"(?i)requisitos\s*:",
+            r"(?i)requisitos\s*\n",
+            r"(?i)-\s*requisito",
+        ]
+        separado = False
+        for sp in split_patterns:
+            partes = re.split(sp, bloque_texto, maxsplit=1)
+            if len(partes) == 2:
+                descripcion = L(partes[0])
+                requisitos  = L(partes[1])
+                separado = True
+                break
+        if not separado:
+            descripcion = bloque_texto
+
+    # Si aún no hay descripción, usar todo el texto de la página menos nav/header
     if not descripcion:
-        # fallback: bloque principal de texto
-        main = soup.select_one("article, .main-content, #content, main")
-        if main:
-            descripcion = limpiar(main.get_text(separator=" "))
+        for el in soup.select("nav, header, footer, script, style, .publicidad, [class*='ad']"):
+            el.decompose()
+        descripcion = L(soup.get_text(separator=" "))
 
-    # Requisitos: sección "Requisitos" si existe
-    requisitos = ""
-    for h3 in soup.find_all(["h3", "h2", "strong"]):
-        if "requisito" in h3.get_text().lower():
-            sib = h3.find_next_sibling()
-            partes = []
-            while sib and len(partes) < 6:
-                t = limpiar(sib.get_text(separator=" "))
-                if t:
-                    partes.append(t)
-                sib = sib.find_next_sibling()
-            requisitos = " ".join(partes)
+    # ── ¿Ya postulaste? ──
+    # Chiletrabajos: botón dice "Postular" (no postulado) o "Postulado" (ya postulado)
+    # El link de postular es /trabajo/postular/NNNNN
+    postulado = False
+    for a in soup.select("a[href]"):
+        href_a = a.get("href", "")
+        txt_a  = L(a.get_text()).lower()
+        clase  = " ".join(a.get("class", [])).lower()
+        # Si el link de postular existe y dice exactamente "Postular" → NO postulado
+        # Si dice "Postulado" o tiene clase "postulado" → SÍ postulado
+        if "/postular/" in href_a:
+            if "postulado" in txt_a or "postulado" in clase:
+                postulado = True
+            # Si sólo dice "postular" (sin 'do') → no postulado, dejar False
             break
-
-    # Postulado
-    postulado = detectar_postulado(soup)
-    # En Chiletrabajos, si estás logueado y postulaste, el botón dice "Postulado"
-    for btn in soup.select("a.btn, button, .postular"):
-        if "postulado" in btn.get_text().lower() or "postulado" in " ".join(btn.get("class", [])).lower():
-            postulado = True
-            break
+    # También revisar el texto completo de la página
+    texto_pagina = soup.get_text().lower()
+    if any(x in texto_pagina for x in [
+        "ya postulaste", "ya postulado", "postulación enviada",
+        "aplicación enviada", "ya aplicaste", "ya te has postulado",
+    ]):
+        postulado = True
 
     return {
         "titulo": titulo, "empresa": empresa, "sueldo": sueldo,
-        "fecha": fecha, "jornada": jornada,
+        "fecha": fecha,   "jornada": jornada,
         "descripcion": descripcion, "requisitos": requisitos,
         "postulado": postulado,
     }
 
 
-# ──────────────────────────────────────────
-# SCRAPER: COMPUTRABAJO
-# URL verificada: https://cl.computrabajo.com/empleos-en-los-lagos-en-osorno
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# COMPUTRABAJO
+# Listado: https://cl.computrabajo.com/empleos-en-los-lagos-en-osorno
+# ──────────────────────────────────────────────────────
 BASE_CT = "https://cl.computrabajo.com"
 
 def listar_computrabajo() -> list:
@@ -397,42 +392,33 @@ def listar_computrabajo() -> list:
         return []
 
     resultado = []
-    # Computrabajo renderiza con JS, pero el HTML inicial trae algunos resultados
-    # Los artículos tienen clase "box_offer" o similar
-    for item in soup.select("article, [class*='box_offer'], [class*='offerList'], li[data-id]"):
-        a = item.find("a", href=True)
-        if not a:
-            continue
+    # Computrabajo: artículos con clase box_offer o links a /oferta-de-trabajo/
+    patron = re.compile(r"/oferta-de-trabajo/|/empleo-")
+    for a in soup.select("a[href]"):
         href = a.get("href", "")
-        if "/oferta-de-trabajo/" not in href and "/empleo-" not in href:
+        if not patron.search(href):
             continue
-        link = abs_url(href, BASE_CT)
-        titulo = limpiar(a.get_text(separator=" "))
-        if len(titulo) < 5:
-            h = item.find(["h2", "h3", "h1"])
-            titulo = limpiar(h.get_text()) if h else ""
-        if len(titulo) < 5:
+        link   = abs_url(href, BASE_CT)
+        titulo = L(a.get_text(separator=" "))
+        # Buscar título en heading padre si el link no tiene texto
+        if len(titulo) < 4:
+            for anc in a.parents:
+                h = anc.find(["h2", "h3"])
+                if h:
+                    titulo = L(h.get_text())
+                    break
+        if len(titulo) < 4 or not link:
             continue
         resultado.append({"titulo": titulo, "link": link, "fuente": "Computrabajo"})
 
-    # Si no encontró artículos (JS bloqueó), intentar con links directos
-    if not resultado:
-        for a in soup.select("a[href*='/oferta-de-trabajo/'], a[href*='/empleo-']"):
-            link = abs_url(a.get("href", ""), BASE_CT)
-            titulo = limpiar(a.get_text(separator=" "))
-            if len(titulo) < 5 or not link:
-                continue
-            resultado.append({"titulo": titulo, "link": link, "fuente": "Computrabajo"})
-
-    vistos = set()
-    unicos = []
+    seen, unicos = set(), []
     for t in resultado:
-        if t["link"] not in vistos:
-            vistos.add(t["link"])
+        if t["link"] not in seen:
+            seen.add(t["link"])
             unicos.append(t)
-
-    log.info(f"Computrabajo: {len(unicos)} ofertas en listado")
+    log.info(f"Computrabajo: {len(unicos)} en listado")
     return unicos
+
 
 def detalle_computrabajo(link: str) -> dict:
     soup = get_soup(link)
@@ -441,70 +427,116 @@ def detalle_computrabajo(link: str) -> dict:
 
     texto_pagina = soup.get_text(" ", strip=True)
 
-    titulo    = primer_texto(soup, "h1", "h1[class*='title']")
-    empresa   = primer_texto(soup,
-        "[class*='company']", "[class*='empresa']",
-        "p.fs16", "a[data-company]", "span[data-company]")
-    sueldo    = primer_texto(soup, "[class*='salary']", "[class*='sueldo']") or buscar_sueldo_regex(texto_pagina)
-    fecha     = primer_texto(soup, "p.fs13", "time", "[class*='date']") or buscar_fecha_regex(texto_pagina)
-    jornada   = detectar_jornada(texto_pagina)
+    titulo  = L(soup.find("h1").get_text()) if soup.find("h1") else ""
+    empresa = ""
+    for sel in ["[class*='company']", "[class*='empresa']", "p.fs16",
+                "a[data-company]", "span[itemprop='name']", "[class*='companyName']"]:
+        el = soup.select_one(sel)
+        if el and L(el.get_text()):
+            empresa = L(el.get_text())
+            break
 
-    descripcion = primer_texto(soup,
-        "#jobDescription", "[class*='description']",
-        "[class*='texto_oferta']", "section.box_detail")
-    requisitos  = primer_texto(soup, "[class*='requirements']", "[class*='requisit']")
+    sueldo  = ""
+    for sel in ["[class*='salary']", "[class*='sueldo']", "[id*='salary']"]:
+        el = soup.select_one(sel)
+        if el and L(el.get_text()):
+            sueldo = L(el.get_text())
+            break
+    if not sueldo:
+        sueldo = regex_sueldo(texto_pagina)
 
-    postulado = detectar_postulado(soup)
+    fecha   = ""
+    for sel in ["time[datetime]", "p.fs13", "[class*='date']", "[class*='fecha']"]:
+        el = soup.select_one(sel)
+        if el:
+            fecha = L(el.get("datetime") or el.get_text())
+            if fecha:
+                break
+    if not fecha:
+        fecha = regex_fecha(texto_pagina)
+
+    jornada = jornada_texto(texto_pagina)
+
+    descripcion = ""
+    for sel in ["#jobDescription", "[class*='description']",
+                "[class*='texto_oferta']", ".box_detail", "article"]:
+        el = soup.select_one(sel)
+        if el and len(L(el.get_text())) > 50:
+            descripcion = L(el.get_text(separator=" "))
+            break
+
+    requisitos = ""
+    for sel in ["[class*='requirements']", "[class*='requisit']"]:
+        el = soup.select_one(sel)
+        if el:
+            requisitos = L(el.get_text(separator=" "))
+            break
+    # Si no hay sección separada, intentar split en el texto de descripción
+    if not requisitos and descripcion:
+        partes = re.split(r"(?i)requisitos\s*:", descripcion, maxsplit=1)
+        if len(partes) == 2:
+            descripcion = L(partes[0])
+            requisitos  = L(partes[1])
+
+    # Postulado
+    postulado = False
+    texto_lower = texto_pagina.lower()
+    if any(x in texto_lower for x in [
+        "ya postulaste", "ya aplicaste", "postulación enviada",
+        "aplicaste a esta", "ya te postulaste",
+    ]):
+        postulado = True
+    for btn in soup.select("button, a.btn, [class*='apply']"):
+        txt = L(btn.get_text()).lower()
+        cls = " ".join(btn.get("class", [])).lower()
+        if "postulado" in txt or "aplicado" in txt or "applied" in txt:
+            postulado = True
+            break
 
     return {
         "titulo": titulo, "empresa": empresa, "sueldo": sueldo,
-        "fecha": fecha, "jornada": jornada,
+        "fecha": fecha,   "jornada": jornada,
         "descripcion": descripcion, "requisitos": requisitos,
         "postulado": postulado,
     }
 
 
-# ──────────────────────────────────────────
-# SCRAPER: INDEED CHILE
-# URL verificada: https://cl.indeed.com/l-osorno,-los-lagos-empleos.html
-# Indeed renderiza con JS; usamos la URL de búsqueda que sí devuelve HTML
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# INDEED CHILE
+# Listado: https://cl.indeed.com/empleos?l=Osorno&sort=date
+# ──────────────────────────────────────────────────────
 BASE_INDEED = "https://cl.indeed.com"
 
 def listar_indeed() -> list:
-    url = f"{BASE_INDEED}/empleos?l=Osorno%2C+Los+Lagos&sort=date"
+    url  = f"{BASE_INDEED}/empleos?l=Osorno%2C+Los+Lagos&sort=date"
     soup = get_soup(url)
     if not soup:
         log.warning("Indeed: sin conexión")
         return []
 
     resultado = []
-    # Indeed usa data-jk o href con /rc/clk o /pagead/clk
-    for card in soup.select("[class*='job_seen_beacon'], [class*='jobsearch-SerpJobCard'], [data-jk]"):
-        a = card.select_one("a[data-jk], a[href*='/rc/clk'], h2 a")
+    for card in soup.select("[data-jk], [class*='job_seen_beacon'], [class*='SerpJobCard']"):
+        a = card.select_one("h2 a[href], a[data-jk]")
         if not a:
             continue
-        href = a.get("href", "")
-        if not href:
-            continue
-        link = abs_url(href, BASE_INDEED)
-        titulo = limpiar(a.get_text(separator=" "))
+        href  = a.get("href", "")
+        link  = abs_url(href, BASE_INDEED)
+        titulo = L(a.get_text(separator=" "))
         if not titulo:
             h = card.find(["h2", "h3"])
-            titulo = limpiar(h.get_text()) if h else ""
-        if len(titulo) < 5 or not link:
+            titulo = L(h.get_text()) if h else ""
+        if len(titulo) < 4 or not link:
             continue
         resultado.append({"titulo": titulo, "link": link, "fuente": "Indeed"})
 
-    vistos = set()
-    unicos = []
+    seen, unicos = set(), []
     for t in resultado:
-        if t["link"] not in vistos:
-            vistos.add(t["link"])
+        if t["link"] not in seen:
+            seen.add(t["link"])
             unicos.append(t)
-
-    log.info(f"Indeed: {len(unicos)} ofertas en listado")
+    log.info(f"Indeed: {len(unicos)} en listado")
     return unicos
+
 
 def detalle_indeed(link: str) -> dict:
     soup = get_soup(link)
@@ -513,36 +545,87 @@ def detalle_indeed(link: str) -> dict:
 
     texto_pagina = soup.get_text(" ", strip=True)
 
-    titulo  = primer_texto(soup, "h1.jobsearch-JobInfoHeader-title", "h1")
-    empresa = primer_texto(soup,
+    titulo  = ""
+    for sel in ["h1.jobsearch-JobInfoHeader-title", "h1[class*='title']", "h1"]:
+        el = soup.select_one(sel)
+        if el:
+            titulo = L(el.get_text())
+            break
+
+    empresa = ""
+    for sel in [
         "[data-testid='inlineHeader-companyName']",
-        "[class*='companyName']", "[class*='company']")
-    sueldo  = primer_texto(soup,
+        "[class*='companyName']", "[class*='company']",
+        "span[itemprop='name']",
+    ]:
+        el = soup.select_one(sel)
+        if el and L(el.get_text()):
+            empresa = L(el.get_text())
+            break
+
+    sueldo = ""
+    for sel in [
         "[class*='salary']", "[id*='salaryInfoAndJobType']",
-        "[data-testid*='salary']") or buscar_sueldo_regex(texto_pagina)
-    fecha   = primer_texto(soup,
-        "[class*='date']", "span[data-testid='myJobsStateDate']",
-        "time") or buscar_fecha_regex(texto_pagina)
-    jornada = detectar_jornada(texto_pagina)
+        "[data-testid*='salary']", "[class*='compensation']",
+    ]:
+        el = soup.select_one(sel)
+        if el and L(el.get_text()):
+            sueldo = L(el.get_text())
+            break
+    if not sueldo:
+        sueldo = regex_sueldo(texto_pagina)
 
-    descripcion = primer_texto(soup,
-        "#jobDescriptionText", "[class*='jobsearch-jobDescriptionText']",
-        "section[class*='description']")
-    requisitos  = ""  # Indeed mezcla descripción y requisitos
+    fecha = ""
+    for sel in ["[data-testid='myJobsStateDate']", "span[class*='date']", "time"]:
+        el = soup.select_one(sel)
+        if el:
+            fecha = L(el.get("datetime") or el.get_text())
+            if fecha:
+                break
+    if not fecha:
+        fecha = regex_fecha(texto_pagina)
 
-    postulado = detectar_postulado(soup)
+    jornada = jornada_texto(texto_pagina)
+
+    descripcion = ""
+    for sel in [
+        "#jobDescriptionText",
+        "[class*='jobsearch-jobDescriptionText']",
+        "[class*='description']", "section",
+    ]:
+        el = soup.select_one(sel)
+        if el and len(L(el.get_text())) > 50:
+            descripcion = L(el.get_text(separator=" "))
+            break
+
+    requisitos = ""
+    if descripcion:
+        partes = re.split(r"(?i)requisitos\s*:", descripcion, maxsplit=1)
+        if len(partes) == 2:
+            descripcion = L(partes[0])
+            requisitos  = L(partes[1])
+
+    postulado = False
+    texto_lower = texto_pagina.lower()
+    if any(x in texto_lower for x in ["applied", "ya postulaste", "ya aplicaste"]):
+        postulado = True
+    for btn in soup.select("button, [class*='apply']"):
+        txt = L(btn.get_text()).lower()
+        if "applied" in txt or "postulado" in txt:
+            postulado = True
+            break
 
     return {
         "titulo": titulo, "empresa": empresa, "sueldo": sueldo,
-        "fecha": fecha, "jornada": jornada,
+        "fecha": fecha,   "jornada": jornada,
         "descripcion": descripcion, "requisitos": requisitos,
         "postulado": postulado,
     }
 
 
-# ──────────────────────────────────────────
-# CONSTRUIR OFERTA COMPLETA
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# CONSTRUIR OFERTA
+# ──────────────────────────────────────────────────────
 DETALLE_FN = {
     "Chiletrabajos": detalle_chiletrabajos,
     "Computrabajo":  detalle_computrabajo,
@@ -555,11 +638,11 @@ def construir_oferta(item: dict) -> Oferta:
     d  = fn(item["link"]) if fn else {}
 
     def v(key: str, fallback: str) -> str:
-        val = limpiar(d.get(key) or "")
+        val = L(d.get(key) or "")
         return val if val else fallback
 
     return Oferta(
-        titulo      = v("titulo",      limpiar(item["titulo"])[:140]) or "Sin título",
+        titulo      = v("titulo",      L(item["titulo"])[:140]) or "Sin título",
         link        = item["link"],
         fuente      = item["fuente"],
         empresa     = v("empresa",     "No especificada"),
@@ -572,19 +655,26 @@ def construir_oferta(item: dict) -> Oferta:
     )
 
 
-# ──────────────────────────────────────────
-# FORMATEAR MENSAJE
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# MENSAJE TELEGRAM
+# ──────────────────────────────────────────────────────
 SEP = "─" * 30
 
 def formatear_mensaje(o: Oferta) -> str:
-    if o.postulado:
-        estado = "✅ YA POSTULASTE A ESTA OFERTA"
-    else:
-        estado = "🆕 NUEVA OFERTA"
+    estado = "✅ YA POSTULASTE" if o.postulado else "🆕 NUEVA OFERTA"
 
-    desc = truncar(o.descripcion, MAX_DESC)
-    req  = truncar(o.requisitos,  MAX_REQ)
+    # Descripción limpia: eliminar frases de navegación que filtran del HTML
+    desc = o.descripcion
+    for ruido in [
+        "PUBLICIDAD", "Volver", "Buscar Ofertas", "Detalle oferta",
+        "Ofertas relacionadas", "Más ofertas", "Guardar", "Compartir",
+        "El anuncio ha sido visto", "Interesados:", "Comparte por redes",
+        "Estadísticas del anuncio", "Denunciar oferta", "Compartir enlace",
+    ]:
+        desc = desc.replace(ruido, "")
+    desc = truncar(L(desc), MAX_DESC)
+
+    req = truncar(L(o.requisitos), MAX_REQ) if o.requisitos != "No especificados" else ""
 
     partes = [
         estado,
@@ -598,48 +688,44 @@ def formatear_mensaje(o: Oferta) -> str:
         "📋 DESCRIPCIÓN",
         desc,
     ]
-    if req and req != "No especificados":
+    if req:
         partes += [SEP, "✔️  REQUISITOS", req]
     partes += [SEP, f"🌐 {o.fuente}", f"🔗 {o.link}"]
+
     return "\n".join(partes)
 
 
-# ──────────────────────────────────────────
-# CICLO PRINCIPAL
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
+# CICLO
+# ──────────────────────────────────────────────────────
 def ciclo(estado: Estado) -> int:
     items: list = []
     items += listar_chiletrabajos()
     items += listar_computrabajo()
     items += listar_indeed()
 
-    # Filtrar URLs ya conocidas antes de hacer fetch de detalle
-    candidatas = []
+    # Filtrar conocidas antes de hacer fetch de detalle
+    candidatas: list = []
     vistos_ciclo: set = set()
     for it in items:
         url = it.get("link", "")
-        if not url:
-            continue
-        if url in vistos_ciclo:       # duplicado dentro del ciclo
-            continue
-        if url in estado.urls:        # ya enviada antes
+        if not url or url in vistos_ciclo or url in estado.urls:
             continue
         vistos_ciclo.add(url)
         candidatas.append(it)
 
     if not candidatas:
-        log.info("Sin candidatas nuevas")
+        log.info("Sin candidatas nuevas en este ciclo")
         return 0
 
-    log.info(f"Candidatas a procesar: {len(candidatas)}")
+    log.info(f"Candidatas: {len(candidatas)}")
     nuevos = 0
 
     for item in candidatas:
         oferta = construir_oferta(item)
 
-        # Segunda barrera: hash de contenido
         if estado.ya_enviado(oferta):
-            log.info(f"  [DUP contenido] {oferta.titulo[:55]}")
+            log.info(f"  [DUP] {oferta.titulo[:55]}")
             estado.marcar_url(oferta.link)
             continue
 
@@ -647,22 +733,22 @@ def ciclo(estado: Estado) -> int:
         if enviar(msg):
             estado.registrar(oferta)
             nuevos += 1
-            log.info(f"  [OK] {oferta.titulo[:55]}")
+            log.info(f"  [OK]  {oferta.titulo[:55]}")
         else:
-            log.error(f"  [ERR] fallo al enviar: {oferta.link}")
+            log.error(f"  [ERR] {oferta.link}")
 
     return nuevos
 
 
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 # MAIN
-# ──────────────────────────────────────────
+# ──────────────────────────────────────────────────────
 def main() -> None:
     log.info("=" * 52)
     log.info("Bot de empleos Osorno — iniciando")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("Debes definir TELEGRAM_TOKEN y TELEGRAM_CHAT_ID como variables de entorno.")
+        log.error("Define TELEGRAM_TOKEN y TELEGRAM_CHAT_ID como variables de entorno.")
         return
 
     estado = Estado()
@@ -675,14 +761,13 @@ def main() -> None:
 
     while True:
         try:
-            t0     = time.time()
-            nuevos = ciclo(estado)
+            t0      = time.time()
+            nuevos  = ciclo(estado)
             elapsed = time.time() - t0
             log.info(f"Ciclo: {nuevos} nuevos | {elapsed:.1f}s")
             time.sleep(max(0, INTERVALO - elapsed))
-
         except KeyboardInterrupt:
-            log.info("Bot detenido por el usuario.")
+            log.info("Bot detenido.")
             break
         except Exception as e:
             log.exception(f"Error inesperado: {e}")
