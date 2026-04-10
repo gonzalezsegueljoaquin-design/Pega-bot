@@ -378,25 +378,52 @@ def upsert_job(o: Oferta) -> Tuple[int, str, str]:
     fingerprint = short_hash(o.title, o.company, o.source)
     job_code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
     with get_db() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(
-            """
-            INSERT INTO jobs(job_code, source, title, company, link, date_text, salary, jornada, description, fingerprint, last_seen_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-            ON CONFLICT (link) DO UPDATE SET
-                title=EXCLUDED.title,
-                company=EXCLUDED.company,
-                date_text=EXCLUDED.date_text,
-                salary=EXCLUDED.salary,
-                jornada=EXCLUDED.jornada,
-                description=EXCLUDED.description,
-                last_seen_at=NOW()
-            RETURNING id, applied_status, (xmax = 0) AS inserted;
-            """,
-            (job_code, o.source, o.title, o.company, o.link, o.date_text, o.salary, o.jornada, o.description, fingerprint),
-        )
-        row = cur.fetchone()
-        conn.commit()
-    return int(row["id"]), str(row["applied_status"]), "inserted" if row["inserted"] else "updated"
+        try:
+            cur.execute(
+                """
+                INSERT INTO jobs(job_code, source, title, company, link, date_text, salary, jornada, description, fingerprint, last_seen_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                ON CONFLICT (link) DO UPDATE SET
+                    title=EXCLUDED.title,
+                    company=EXCLUDED.company,
+                    date_text=EXCLUDED.date_text,
+                    salary=EXCLUDED.salary,
+                    jornada=EXCLUDED.jornada,
+                    description=EXCLUDED.description,
+                    fingerprint=EXCLUDED.fingerprint,
+                    last_seen_at=NOW()
+                RETURNING id, applied_status, (xmax = 0) AS inserted;
+                """,
+                (job_code, o.source, o.title, o.company, o.link, o.date_text, o.salary, o.jornada, o.description, fingerprint),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return int(row["id"]), str(row["applied_status"]), "inserted" if row["inserted"] else "updated"
+        except psycopg2.errors.UniqueViolation:
+            # Same posting can appear with a different URL. If fingerprint already exists,
+            # update the existing row instead of failing the whole cycle.
+            conn.rollback()
+            cur.execute(
+                """
+                UPDATE jobs
+                SET
+                    title=%s,
+                    company=%s,
+                    date_text=%s,
+                    salary=%s,
+                    jornada=%s,
+                    description=%s,
+                    last_seen_at=NOW()
+                WHERE fingerprint=%s
+                RETURNING id, applied_status;
+                """,
+                (o.title, o.company, o.date_text, o.salary, o.jornada, o.description, fingerprint),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            if not row:
+                raise
+            return int(row["id"]), str(row["applied_status"]), "updated"
 
 
 def register_notification(job_id: int, message_id: Optional[int]) -> None:
