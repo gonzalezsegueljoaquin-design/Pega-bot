@@ -263,7 +263,7 @@ def formatear_digest(ofertas: List[Tuple[Oferta, str]]) -> str:
     return "\n".join(lines)
 
 
-def formatear_heartbeat(cycle_num: int, total_found: int, new_count: int, updated_count: int, per_source: Dict[str, int]) -> str:
+def formatear_heartbeat(cycle_num: int, total_found: int, new_count: int, existing_count: int, per_source: Dict[str, int]) -> str:
     fuentes_line = " | ".join([f"{k}:{v}" for k, v in per_source.items()]) if per_source else "sin datos"
     return (
         "🫀 BOT EN LINEA - OSORNO\n"
@@ -271,7 +271,7 @@ def formatear_heartbeat(cycle_num: int, total_found: int, new_count: int, update
         f"🔁 Ciclo: {cycle_num}\n"
         f"📥 Encontradas: {total_found}\n"
         f"🆕 Nuevas: {new_count}\n"
-        f"♻️ Actualizadas: {updated_count}\n"
+        f"📚 Ya registradas: {existing_count}\n"
         f"🌐 Fuentes: {fuentes_line}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Comando rapido: /stats"
@@ -699,47 +699,34 @@ def upsert_job(o: Oferta) -> Tuple[int, str, str]:
                 """
                 INSERT INTO jobs(job_code, source, title, company, link, date_text, salary, jornada, description, fingerprint, last_seen_at)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                ON CONFLICT (link) DO UPDATE SET
-                    title=EXCLUDED.title,
-                    company=EXCLUDED.company,
-                    date_text=EXCLUDED.date_text,
-                    salary=EXCLUDED.salary,
-                    jornada=EXCLUDED.jornada,
-                    description=EXCLUDED.description,
-                    fingerprint=EXCLUDED.fingerprint,
-                    last_seen_at=NOW()
+                ON CONFLICT (link) DO NOTHING
                 RETURNING id, applied_status, (xmax = 0) AS inserted;
                 """,
                 (job_code, o.source, o.title, o.company, o.link, o.date_text, o.salary, o.jornada, o.description, fingerprint),
             )
             row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                cur.execute("SELECT id, applied_status FROM jobs WHERE link=%s", (o.link,))
+                row = cur.fetchone()
+                return int(row["id"]), str(row["applied_status"]), "exists"
             conn.commit()
             return int(row["id"]), str(row["applied_status"]), "inserted" if row["inserted"] else "updated"
         except psycopg2.errors.UniqueViolation:
-            # Same posting can appear with a different URL. If fingerprint already exists,
-            # update the existing row instead of failing the whole cycle.
+            # Same posting can appear with a different URL. If fingerprint exists, skip it.
             conn.rollback()
             cur.execute(
                 """
-                UPDATE jobs
-                SET
-                    title=%s,
-                    company=%s,
-                    date_text=%s,
-                    salary=%s,
-                    jornada=%s,
-                    description=%s,
-                    last_seen_at=NOW()
+                SELECT id, applied_status
+                FROM jobs
                 WHERE fingerprint=%s
-                RETURNING id, applied_status;
                 """,
-                (o.title, o.company, o.date_text, o.salary, o.jornada, o.description, fingerprint),
+                (fingerprint,),
             )
             row = cur.fetchone()
-            conn.commit()
             if not row:
                 raise
-            return int(row["id"]), str(row["applied_status"]), "updated"
+            return int(row["id"]), str(row["applied_status"]), "exists"
 
 
 def register_notification(job_id: int, message_id: Optional[int]) -> None:
@@ -822,10 +809,40 @@ def parse_command(text: str) -> Tuple[str, str]:
     t = limpiar(text)
     if re.match(r"^/stats$", t, re.I):
         return "stats", ""
+    if re.match(r"^/ultimas$", t, re.I):
+        return "ultimas", ""
     m = re.match(r"^/(postule|nopostule|estado)\s+([A-Za-z]{2}-[A-F0-9]{10})$", t, re.I)
     if not m:
         return "", ""
     return m.group(1).lower(), m.group(2).upper()
+
+
+def ultimas_ofertas(limit: int = 8) -> List[Tuple[str, str, str, str]]:
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT source, title, job_code, link
+            FROM jobs
+            ORDER BY last_seen_at DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        rows = cur.fetchall()
+    return [(str(r[0]), str(r[1]), str(r[2]), str(r[3])) for r in rows]
+
+
+def formatear_ultimas(rows: List[Tuple[str, str, str, str]]) -> str:
+    if not rows:
+        return "📭 Aun no hay ofertas guardadas."
+    lines = ["📌 ULTIMAS OFERTAS DETECTADAS", "━━━━━━━━━━━━━━━━━━━━"]
+    for source, title, code, link in rows:
+        lines.append(f"• [{source}] {title}")
+        lines.append(f"  🆔 {code}")
+        lines.append(f"  🔗 {link}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    lines.append("Tip: usa /estado CODIGO o /postule CODIGO")
+    return "\n".join(lines)
 
 
 def process_telegram_commands() -> None:
@@ -859,6 +876,8 @@ def process_telegram_commands() -> None:
         elif cmd == "stats":
             total, day = job_counts()
             enviar(f"📊 Estadisticas\nTotal ofertas en DB: {total}\nNuevas ultimas 24h: {day}")
+        elif cmd == "ultimas":
+            enviar(formatear_ultimas(ultimas_ofertas(8)))
 
 
 def run_cycle() -> Dict[str, object]:
@@ -881,7 +900,7 @@ def run_cycle() -> Dict[str, object]:
             log.exception("Fuente fallo %s: %s", fn.__name__, e)
 
     new_count = 0
-    updated_count = 0
+    existing_count = 0
     digest_bucket: List[Tuple[Oferta, str]] = []
     for o in dedup(found):
         o = enriquecer_oferta(o)
@@ -889,7 +908,7 @@ def run_cycle() -> Dict[str, object]:
             continue
         job_id, applied_status, op = upsert_job(o)
         if op != "inserted":
-            updated_count += 1
+            existing_count += 1
             continue
         code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
         if score_oferta(o) >= MIN_SCORE_IMMEDIATE:
@@ -906,16 +925,16 @@ def run_cycle() -> Dict[str, object]:
         enviar(formatear_digest(digest_bucket))
 
     log.info(
-        "Detalle ciclo | fuentes=%s | encontradas=%s | nuevas=%s | actualizadas=%s",
+        "Detalle ciclo | fuentes=%s | encontradas=%s | nuevas=%s | ya_registradas=%s",
         per_source,
         len(found),
         new_count,
-        updated_count,
+        existing_count,
     )
     return {
         "new_count": new_count,
         "found_count": len(found),
-        "updated_count": updated_count,
+        "existing_count": existing_count,
         "per_source": per_source,
         "cycle_num": cycle_num,
     }
@@ -950,7 +969,7 @@ def main() -> None:
         f"⏱️ Intervalo: {INTERVALO}s\n"
         f"🧠 Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
         f"⭐ Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}\n"
-        "🛠️ Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO | /stats\n"
+        "🛠️ Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO | /stats | /ultimas\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
     while True:
@@ -965,7 +984,7 @@ def main() -> None:
                         cycle_num=int(cycle_stats["cycle_num"]),
                         total_found=int(cycle_stats["found_count"]),
                         new_count=int(cycle_stats["new_count"]),
-                        updated_count=int(cycle_stats["updated_count"]),
+                        existing_count=int(cycle_stats["existing_count"]),
                         per_source=dict(cycle_stats["per_source"]),
                     )
                 )
