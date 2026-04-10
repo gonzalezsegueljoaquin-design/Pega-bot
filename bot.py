@@ -19,6 +19,10 @@ from bs4 import BeautifulSoup
 
 INTERVALO = int(os.getenv("INTERVALO", "45"))
 TIMEOUT = int(os.getenv("TIMEOUT", "20"))
+CONNECT_TIMEOUT = int(os.getenv("CONNECT_TIMEOUT", "8"))
+READ_TIMEOUT = int(os.getenv("READ_TIMEOUT", "20"))
+CHILETRABAJOS_CONNECT_TIMEOUT = int(os.getenv("CHILETRABAJOS_CONNECT_TIMEOUT", "5"))
+CHILETRABAJOS_READ_TIMEOUT = int(os.getenv("CHILETRABAJOS_READ_TIMEOUT", "12"))
 MAX_DESC = 700
 MAX_MSG = 4096
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -456,13 +460,22 @@ def should_cooldown(source: str) -> bool:
 
 
 def get_soup(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
+    is_chiletrabajos = "chiletrabajos.cl" in url.lower()
+    timeout_cfg = (
+        CHILETRABAJOS_CONNECT_TIMEOUT,
+        CHILETRABAJOS_READ_TIMEOUT,
+    ) if is_chiletrabajos else (CONNECT_TIMEOUT, READ_TIMEOUT)
+
     for i in range(1, retries + 1):
         try:
-            r = SESSION.get(url, timeout=TIMEOUT)
+            r = SESSION.get(url, timeout=timeout_cfg)
             r.raise_for_status()
             return BeautifulSoup(r.text, "html.parser")
         except requests.RequestException as e:
             log.warning("GET [%s/%s] %s: %s", i, retries, url, e)
+            # For portal/network timeout storms, fail fast to keep cycles healthy.
+            if isinstance(e, (requests.ConnectTimeout, requests.ReadTimeout)):
+                break
             time.sleep(0.8 * i)
     return None
 
@@ -475,10 +488,16 @@ def parse_chiletrabajos() -> List[Oferta]:
     base = "https://www.chiletrabajos.cl"
     pages = [f"{base}/ciudad/osorno.html", f"{base}/ciudad/osorno.html/30", f"{base}/ciudad/osorno.html/60"]
     try:
+        fallas_consecutivas = 0
         for p in pages:
-            soup = get_soup(p)
+            soup = get_soup(p, retries=1)
             if not soup:
+                fallas_consecutivas += 1
+                if fallas_consecutivas >= 2:
+                    log.warning("Chiletrabajos: corte temprano por timeouts consecutivos")
+                    break
                 continue
+            fallas_consecutivas = 0
             for h2 in soup.find_all("h2"):
                 a = h2.find("a", href=True)
                 if not a:
