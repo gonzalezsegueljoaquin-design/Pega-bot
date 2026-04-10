@@ -148,7 +148,8 @@ def format_estado(status: str) -> str:
 
 
 def formatear_oferta(o: Oferta, job_code: str, applied_status: str) -> str:
-    parts = [
+    footer = f"Comandos: /postule {job_code} | /nopostule {job_code} | /estado {job_code}"
+    header_parts = [
         f"🆕 NUEVA OFERTA [{o.source}]",
         "────────────────────────────",
         f"🆔 Codigo: {job_code}",
@@ -158,13 +159,81 @@ def formatear_oferta(o: Oferta, job_code: str, applied_status: str) -> str:
         f"🕒 Jornada: {o.jornada}",
         f"💰 Sueldo: {o.salary}",
         f"📮 Estado postulacion: {format_estado(applied_status)}",
-        "────────────────────────────",
-        limpiar(o.description)[:MAX_DESC],
-        f"🔗 {o.link}",
-        "────────────────────────────",
-        f"Comandos: /postule {job_code} | /nopostule {job_code} | /estado {job_code}",
     ]
-    return "\n".join(parts)
+    core = "\n".join(header_parts) + "\n────────────────────────────\n"
+    tail = f"\n🔗 {o.link}\n────────────────────────────\n{footer}"
+    max_desc_len = max(80, MAX_MSG - len(core) - len(tail) - 10)
+    desc = limpiar(o.description)
+    if len(desc) > max_desc_len:
+        desc = desc[: max_desc_len - 3].rstrip() + "..."
+    return core + desc + tail
+
+
+def extraer_tabla_valor(soup: BeautifulSoup, clave: str) -> str:
+    for td in soup.select("table td"):
+        txt = limpiar(td.get_text(" ")).lower()
+        if clave in txt:
+            sib = td.find_next_sibling("td")
+            if sib:
+                return limpiar(sib.get_text(" "))
+    return ""
+
+
+def detalle_chiletrabajos(link: str) -> Dict[str, str]:
+    soup = get_soup(link, retries=2)
+    if not soup:
+        return {}
+
+    texto = limpiar(soup.get_text(" "))
+    empresa = (
+        extraer_tabla_valor(soup, "empresa")
+        or extraer_tabla_valor(soup, "buscado")
+        or ""
+    )
+    fecha = extraer_tabla_valor(soup, "fecha")
+    jornada = extraer_tabla_valor(soup, "tipo")
+    sueldo = extraer_tabla_valor(soup, "salario")
+
+    if sueldo and not sueldo.startswith("$"):
+        sueldo = f"${sueldo}"
+
+    descripcion = ""
+    h_desc = None
+    for tag in soup.find_all(["h2", "h3"]):
+        if "descripci" in limpiar(tag.get_text(" ")).lower():
+            h_desc = tag
+            break
+    if h_desc:
+        bloques: List[str] = []
+        for sib in h_desc.next_siblings:
+            if getattr(sib, "name", None) in ("h2", "h3"):
+                break
+            if hasattr(sib, "get_text"):
+                t = limpiar(sib.get_text(" "))
+                if t:
+                    bloques.append(t)
+        descripcion = limpiar(" ".join(bloques))
+
+    if not descripcion:
+        bloque = soup.select_one("article, main, .oferta-content, #oferta")
+        if bloque:
+            descripcion = limpiar(bloque.get_text(" "))
+
+    if not descripcion:
+        descripcion = texto[:900]
+
+    postulado = bool(
+        re.search(r"\b(postulado|ya postulaste|postulaci[oó]n enviada|ya aplicaste)\b", texto, re.I)
+    )
+
+    return {
+        "empresa": empresa,
+        "fecha": fecha,
+        "jornada": jornada,
+        "sueldo": sueldo,
+        "descripcion": descripcion,
+        "postulado": "1" if postulado else "0",
+    }
 
 
 def set_source_ok(source: str) -> None:
@@ -243,8 +312,31 @@ def parse_chiletrabajos() -> List[Oferta]:
                 if not title:
                     continue
                 h3 = h2.find_next_sibling("h3")
-                empresa = limpiar((h3.get_text(" ") if h3 else "").split(",")[0]) or "No especificada"
-                out.append(Oferta(source=source, title=title, link=link, company=empresa))
+                empresa_listado = limpiar((h3.get_text(" ") if h3 else "").split(",")[0])
+                fecha_listado = ""
+                h3_fecha = h3.find_next_sibling("h3") if h3 else None
+                if h3_fecha:
+                    fecha_listado = limpiar(h3_fecha.get_text(" "))
+
+                d = detalle_chiletrabajos(link)
+                empresa = limpiar(d.get("empresa", "")) or empresa_listado or "No especificada"
+                # Avoid sending RUT as company name
+                if re.fullmatch(r"\d{1,2}\.\d{3}\.\d{3}-[\dkK]", empresa):
+                    empresa = empresa_listado or "No especificada"
+
+                out.append(
+                    Oferta(
+                        source=source,
+                        title=title,
+                        link=link,
+                        company=empresa,
+                        date_text=limpiar(d.get("fecha", "")) or fecha_listado or "No especificada",
+                        salary=limpiar(d.get("sueldo", "")) or "No especificado",
+                        jornada=limpiar(d.get("jornada", "")) or "No especificada",
+                        description=limpiar(d.get("descripcion", "")) or "No disponible",
+                        postulado_detectado=True if d.get("postulado") == "1" else None,
+                    )
+                )
         set_source_ok(source)
         return dedup(out)
     except Exception as e:
