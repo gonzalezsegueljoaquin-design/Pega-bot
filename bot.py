@@ -26,6 +26,7 @@ CHILETRABAJOS_READ_TIMEOUT = int(os.getenv("CHILETRABAJOS_READ_TIMEOUT", "12"))
 MAX_DESC = 700
 MAX_MSG = 4096
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+COLOR_LOGS = os.getenv("COLOR_LOGS", "1") == "1"
 ENABLE_DETAIL_ENRICHMENT = os.getenv("ENABLE_DETAIL_ENRICHMENT", "1") == "1"
 DETAIL_RETRIES = int(os.getenv("DETAIL_RETRIES", "1"))
 DETAIL_DELAY_MS = int(os.getenv("DETAIL_DELAY_MS", "350"))
@@ -49,10 +50,35 @@ HEADERS = {
     "Accept-Language": "es-CL,es;q=0.9",
 }
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        logging.DEBUG: "\033[36m",   # cyan
+        logging.INFO: "\033[32m",    # green
+        logging.WARNING: "\033[33m", # yellow
+        logging.ERROR: "\033[31m",   # red
+        logging.CRITICAL: "\033[35m",
+    }
+    RESET = "\033[0m"
+    LEVEL_LABEL = {
+        logging.INFO: "OK",
+        logging.WARNING: "WARN",
+        logging.ERROR: "ERR",
+        logging.CRITICAL: "CRIT",
+        logging.DEBUG: "DBG",
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        tag = self.LEVEL_LABEL.get(record.levelno, record.levelname)
+        if COLOR_LOGS:
+            color = self.COLORS.get(record.levelno, "")
+            return f"{color}[{tag}] {base}{self.RESET}"
+        return f"[{tag}] {base}"
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(ColorFormatter("%(asctime)s [%(levelname)s] %(message)s"))
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), handlers=[_handler], force=True)
 log = logging.getLogger("pega-bot")
 
 SESSION = requests.Session()
