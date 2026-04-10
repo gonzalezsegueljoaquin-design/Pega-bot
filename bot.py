@@ -25,6 +25,11 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 ENABLE_DETAIL_ENRICHMENT = os.getenv("ENABLE_DETAIL_ENRICHMENT", "1") == "1"
 DETAIL_RETRIES = int(os.getenv("DETAIL_RETRIES", "1"))
 DETAIL_DELAY_MS = int(os.getenv("DETAIL_DELAY_MS", "350"))
+KEYWORDS_INCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_INCLUDE", "").split(",") if k.strip()]
+KEYWORDS_EXCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_EXCLUDE", "").split(",") if k.strip()]
+MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "3"))
+DIGEST_EVERY_CYCLES = int(os.getenv("DIGEST_EVERY_CYCLES", "3"))
+DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "23"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -73,6 +78,51 @@ def limpiar(txt: str) -> str:
 def short_hash(*parts: str) -> str:
     base = limpiar("|".join(parts)).lower()
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:10].upper()
+
+
+def resumen_texto(texto: str) -> str:
+    limpio = limpiar(texto)
+    if not limpio:
+        return "No disponible"
+    partes = re.split(r"(?<=[\.\!\?])\s+", limpio)
+    utiles: List[str] = []
+    for p in partes:
+        t = limpiar(p)
+        if len(t) < 35:
+            continue
+        utiles.append(t)
+        if len(utiles) >= 3:
+            break
+    if not utiles:
+        return limpio[:280]
+    return " ".join(utiles)[:420]
+
+
+def score_oferta(o: Oferta) -> int:
+    txt = f"{o.title} {o.company} {o.description}".lower()
+    score = 0
+    if "osorno" in txt:
+        score += 1
+    if o.salary and o.salary != "No especificado":
+        score += 1
+    if o.jornada and o.jornada != "No especificada":
+        score += 1
+    if KEYWORDS_INCLUDE and any(k in txt for k in KEYWORDS_INCLUDE):
+        score += 2
+    if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
+        score -= 3
+    return score
+
+
+def pasa_filtros(o: Oferta) -> bool:
+    txt = f"{o.title} {o.company} {o.description} {o.link}".lower()
+    if "osorno" not in txt:
+        return False
+    if KEYWORDS_INCLUDE and not any(k in txt for k in KEYWORDS_INCLUDE):
+        return False
+    if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
+        return False
+    return True
 
 
 def get_db():
@@ -166,10 +216,20 @@ def formatear_oferta(o: Oferta, job_code: str, applied_status: str) -> str:
     core = "\n".join(header_parts) + "\n────────────────────────────\n"
     tail = f"\n🔗 {o.link}\n────────────────────────────\n{footer}"
     max_desc_len = max(80, MAX_MSG - len(core) - len(tail) - 10)
-    desc = limpiar(o.description)
+    desc = resumen_texto(o.description)
     if len(desc) > max_desc_len:
         desc = desc[: max_desc_len - 3].rstrip() + "..."
     return core + desc + tail
+
+
+def formatear_digest(ofertas: List[Tuple[Oferta, str]]) -> str:
+    lines = ["📦 DIGEST OFERTAS OSORNO", "────────────────────────────"]
+    for o, code in ofertas[:15]:
+        lines.append(f"- [{o.source}] {o.title} ({code})")
+    if len(ofertas) > 15:
+        lines.append(f"... y {len(ofertas) - 15} mas")
+    lines.append("Usa /estado CODIGO para revisar una oferta.")
+    return "\n".join(lines)
 
 
 def extraer_tabla_valor(soup: BeautifulSoup, clave: str) -> str:
@@ -649,6 +709,25 @@ def get_offset() -> int:
         return int(row[0]) if row else 0
 
 
+def get_state_int(key: str, default: int = 0) -> int:
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT value FROM bot_state WHERE key=%s", (key,))
+        row = cur.fetchone()
+        return int(row[0]) if row else default
+
+
+def set_state_str(key: str, value: str) -> None:
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO bot_state(key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """,
+            (key, value),
+        )
+        conn.commit()
+
+
 def update_applied(job_code: str, status: str) -> bool:
     with get_db() as conn, conn.cursor() as cur:
         cur.execute(
@@ -669,8 +748,19 @@ def get_job_status(job_code: str) -> Optional[Tuple[str, str]]:
         return row[0], row[1]
 
 
+def job_counts() -> Tuple[int, int]:
+    with get_db() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM jobs")
+        total = int(cur.fetchone()[0])
+        cur.execute("SELECT COUNT(*) FROM jobs WHERE first_seen_at >= NOW() - INTERVAL '24 hours'")
+        day = int(cur.fetchone()[0])
+    return total, day
+
+
 def parse_command(text: str) -> Tuple[str, str]:
     t = limpiar(text)
+    if re.match(r"^/stats$", t, re.I):
+        return "stats", ""
     m = re.match(r"^/(postule|nopostule|estado)\s+([A-Za-z]{2}-[A-F0-9]{10})$", t, re.I)
     if not m:
         return "", ""
@@ -705,6 +795,9 @@ def process_telegram_commands() -> None:
                 enviar(f"❌ No encuentro el codigo {code}")
             else:
                 enviar(f"📌 {st[0]}\n🆔 {code}\n📮 {format_estado(st[1])}")
+        elif cmd == "stats":
+            total, day = job_counts()
+            enviar(f"📊 Estadisticas\nTotal ofertas en DB: {total}\nNuevas ultimas 24h: {day}")
 
 
 def run_cycle() -> int:
@@ -716,23 +809,67 @@ def run_cycle() -> int:
         parse_yapo,
     ]
     found: List[Oferta] = []
+    per_source: Dict[str, int] = {}
     for fn in sources:
         try:
-            found.extend(fn())
+            items = fn()
+            found.extend(items)
+            source_name = fn.__name__.replace("parse_", "").replace("_rss", "").capitalize()
+            per_source[source_name] = len(items)
         except Exception as e:
             log.exception("Fuente fallo %s: %s", fn.__name__, e)
 
     new_count = 0
+    updated_count = 0
+    digest_bucket: List[Tuple[Oferta, str]] = []
     for o in dedup(found):
         o = enriquecer_oferta(o)
+        if not pasa_filtros(o):
+            continue
         job_id, applied_status, op = upsert_job(o)
         if op != "inserted":
+            updated_count += 1
             continue
-        msg = formatear_oferta(o, f"{o.source[:2].upper()}-{short_hash(o.link)}", applied_status)
-        message_id = enviar(msg)
-        register_notification(job_id, message_id)
+        code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
+        if score_oferta(o) >= MIN_SCORE_IMMEDIATE:
+            msg = formatear_oferta(o, code, applied_status)
+            message_id = enviar(msg)
+            register_notification(job_id, message_id)
+        else:
+            digest_bucket.append((o, code))
         new_count += 1
+
+    cycle_num = get_state_int("cycle_counter", 0) + 1
+    set_state_str("cycle_counter", str(cycle_num))
+    if digest_bucket and cycle_num % max(1, DIGEST_EVERY_CYCLES) == 0:
+        enviar(formatear_digest(digest_bucket))
+
+    log.info(
+        "Detalle ciclo | fuentes=%s | encontradas=%s | nuevas=%s | actualizadas=%s",
+        per_source,
+        len(found),
+        new_count,
+        updated_count,
+    )
     return new_count
+
+
+def enviar_reporte_diario_si_corresponde() -> None:
+    now = now_utc()
+    if now.hour != DAILY_REPORT_HOUR_UTC:
+        return
+    today_key = now.strftime("%Y-%m-%d")
+    last_key = "daily_report_last_date"
+    if get_state_int(last_key, 0) == int(today_key.replace("-", "")):
+        return
+    total, day = job_counts()
+    enviar(
+        "📈 REPORTE DIARIO\n"
+        f"Fecha UTC: {today_key}\n"
+        f"Total ofertas en DB: {total}\n"
+        f"Nuevas ultimas 24h: {day}"
+    )
+    set_state_str(last_key, str(int(today_key.replace("-", ""))))
 
 
 def main() -> None:
@@ -743,13 +880,15 @@ def main() -> None:
         "🚀 Bot empleos Osorno activo\n"
         "Fuentes: Chiletrabajos, BNE, Indeed, Computrabajo, Yapo\n"
         "Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO\n"
-        f"Intervalo: {INTERVALO}s | Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}"
+        f"Intervalo: {INTERVALO}s | Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
+        f"Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}"
     )
     while True:
         start = time.time()
         try:
             process_telegram_commands()
             nuevos = run_cycle()
+            enviar_reporte_diario_si_corresponde()
             elapsed = time.time() - start
             log.info("Ciclo OK | nuevos=%s | %.1fs", nuevos, elapsed)
         except Exception as e:
