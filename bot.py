@@ -30,6 +30,7 @@ KEYWORDS_EXCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_EXCLUDE", "")
 MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "3"))
 DIGEST_EVERY_CYCLES = int(os.getenv("DIGEST_EVERY_CYCLES", "3"))
 DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "23"))
+HEARTBEAT_EVERY_CYCLES = int(os.getenv("HEARTBEAT_EVERY_CYCLES", "4"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -230,6 +231,21 @@ def formatear_digest(ofertas: List[Tuple[Oferta, str]]) -> str:
         lines.append(f"... y {len(ofertas) - 15} mas")
     lines.append("Usa /estado CODIGO para revisar una oferta.")
     return "\n".join(lines)
+
+
+def formatear_heartbeat(cycle_num: int, total_found: int, new_count: int, updated_count: int, per_source: Dict[str, int]) -> str:
+    fuentes_line = " | ".join([f"{k}:{v}" for k, v in per_source.items()]) if per_source else "sin datos"
+    return (
+        "🫀 BOT EN LINEA - OSORNO\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔁 Ciclo: {cycle_num}\n"
+        f"📥 Encontradas: {total_found}\n"
+        f"🆕 Nuevas: {new_count}\n"
+        f"♻️ Actualizadas: {updated_count}\n"
+        f"🌐 Fuentes: {fuentes_line}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Comando rapido: /stats"
+    )
 
 
 def extraer_tabla_valor(soup: BeautifulSoup, clave: str) -> str:
@@ -800,7 +816,7 @@ def process_telegram_commands() -> None:
             enviar(f"📊 Estadisticas\nTotal ofertas en DB: {total}\nNuevas ultimas 24h: {day}")
 
 
-def run_cycle() -> int:
+def run_cycle() -> Dict[str, object]:
     sources = [
         parse_chiletrabajos,
         parse_bne,
@@ -851,7 +867,13 @@ def run_cycle() -> int:
         new_count,
         updated_count,
     )
-    return new_count
+    return {
+        "new_count": new_count,
+        "found_count": len(found),
+        "updated_count": updated_count,
+        "per_source": per_source,
+        "cycle_num": cycle_num,
+    }
 
 
 def enviar_reporte_diario_si_corresponde() -> None:
@@ -877,20 +899,33 @@ def main() -> None:
         raise RuntimeError("Config incompleta. Requiere TELEGRAM_TOKEN, TELEGRAM_CHAT_ID y DATABASE_URL")
     init_db()
     enviar(
-        "🚀 Bot empleos Osorno activo\n"
-        "Fuentes: Chiletrabajos, BNE, Indeed, Computrabajo, Yapo\n"
-        "Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO\n"
-        f"Intervalo: {INTERVALO}s | Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
-        f"Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}"
+        "🚀 BOT EMPLEOS OSORNO ACTIVO\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🌐 Fuentes: Chiletrabajos | BNE | Indeed | Computrabajo | Yapo\n"
+        f"⏱️ Intervalo: {INTERVALO}s\n"
+        f"🧠 Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
+        f"⭐ Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}\n"
+        "🛠️ Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO | /stats\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
     while True:
         start = time.time()
         try:
             process_telegram_commands()
-            nuevos = run_cycle()
+            cycle_stats = run_cycle()
             enviar_reporte_diario_si_corresponde()
+            if cycle_stats["cycle_num"] % max(1, HEARTBEAT_EVERY_CYCLES) == 0:
+                enviar(
+                    formatear_heartbeat(
+                        cycle_num=int(cycle_stats["cycle_num"]),
+                        total_found=int(cycle_stats["found_count"]),
+                        new_count=int(cycle_stats["new_count"]),
+                        updated_count=int(cycle_stats["updated_count"]),
+                        per_source=dict(cycle_stats["per_source"]),
+                    )
+                )
             elapsed = time.time() - start
-            log.info("Ciclo OK | nuevos=%s | %.1fs", nuevos, elapsed)
+            log.info("Ciclo OK | nuevos=%s | %.1fs", int(cycle_stats["new_count"]), elapsed)
         except Exception as e:
             log.exception("Error ciclo: %s", e)
             enviar(f"❌ Error ciclo: {str(e)[:200]}")
