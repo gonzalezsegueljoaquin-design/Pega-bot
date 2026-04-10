@@ -17,11 +17,14 @@ import requests
 from bs4 import BeautifulSoup
 
 
-INTERVALO = int(os.getenv("INTERVALO", "180"))
+INTERVALO = int(os.getenv("INTERVALO", "45"))
 TIMEOUT = int(os.getenv("TIMEOUT", "20"))
 MAX_DESC = 700
 MAX_MSG = 4096
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+ENABLE_DETAIL_ENRICHMENT = os.getenv("ENABLE_DETAIL_ENRICHMENT", "1") == "1"
+DETAIL_RETRIES = int(os.getenv("DETAIL_RETRIES", "1"))
+DETAIL_DELAY_MS = int(os.getenv("DETAIL_DELAY_MS", "350"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -234,6 +237,106 @@ def detalle_chiletrabajos(link: str) -> Dict[str, str]:
         "descripcion": descripcion,
         "postulado": "1" if postulado else "0",
     }
+
+
+def detalle_generico(link: str) -> Dict[str, str]:
+    soup = get_soup(link, retries=max(1, DETAIL_RETRIES))
+    if not soup:
+        return {}
+    texto = limpiar(soup.get_text(" "))
+
+    titulo = ""
+    for sel in ["h1", "meta[property='og:title']"]:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        titulo = limpiar(el.get_text(" ")) if el.name != "meta" else limpiar(el.get("content", ""))
+        if titulo:
+            break
+
+    descripcion = ""
+    for sel in ["#jobDescriptionText", "article", "main", "[class*='description']", "meta[property='og:description']"]:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        if el.name == "meta":
+            descripcion = limpiar(el.get("content", ""))
+        else:
+            descripcion = limpiar(el.get_text(" "))
+        if len(descripcion) >= 60:
+            break
+    if not descripcion:
+        descripcion = texto[:900]
+
+    empresa = ""
+    for sel in [
+        "[data-testid='company-name']",
+        "[data-testid='inlineHeader-companyName']",
+        "[class*='company']",
+        "meta[property='og:site_name']",
+    ]:
+        el = soup.select_one(sel)
+        if not el:
+            continue
+        empresa = limpiar(el.get_text(" ")) if el.name != "meta" else limpiar(el.get("content", ""))
+        if empresa:
+            break
+
+    sueldo = ""
+    m_sueldo = re.search(r"\$\s*[\d\.\,]+(?:\s*[-–]\s*\$?\s*[\d\.\,]+)?", texto)
+    if m_sueldo:
+        sueldo = limpiar(m_sueldo.group(0))
+
+    fecha = ""
+    m_fecha = re.search(
+        r"(hace\s+\d+\s+(?:minuto|minutos|hora|horas|d[ií]a|d[ií]as|semana|semanas)|\d{1,2}\s+de\s+\w+\s+de\s+\d{4}|\d{4}-\d{2}-\d{2})",
+        texto,
+        re.I,
+    )
+    if m_fecha:
+        fecha = limpiar(m_fecha.group(0))
+
+    jornada = ""
+    t = texto.lower()
+    if re.search(r"part.?time|jornada parcial|medio tiempo", t):
+        jornada = "Part Time"
+    elif re.search(r"full.?time|jornada completa|tiempo completo", t):
+        jornada = "Full Time"
+
+    postulado = bool(
+        re.search(r"\b(applied|postulado|ya postulaste|postulaci[oó]n enviada|ya aplicaste)\b", texto, re.I)
+    )
+    return {
+        "titulo": titulo,
+        "empresa": empresa,
+        "fecha": fecha,
+        "jornada": jornada,
+        "sueldo": sueldo,
+        "descripcion": descripcion,
+        "postulado": "1" if postulado else "0",
+    }
+
+
+def enriquecer_oferta(o: Oferta) -> Oferta:
+    # Chiletrabajos already has dedicated detail parsing in listing phase.
+    if not ENABLE_DETAIL_ENRICHMENT or o.source == "Chiletrabajos":
+        return o
+    d = detalle_generico(o.link)
+    if DETAIL_DELAY_MS > 0:
+        time.sleep(DETAIL_DELAY_MS / 1000)
+    if not d:
+        return o
+    return Oferta(
+        source=o.source,
+        title=limpiar(d.get("titulo", "")) or o.title,
+        link=o.link,
+        company=limpiar(d.get("empresa", "")) or o.company,
+        date_text=limpiar(d.get("fecha", "")) or o.date_text,
+        salary=limpiar(d.get("sueldo", "")) or o.salary,
+        jornada=limpiar(d.get("jornada", "")) or o.jornada,
+        description=limpiar(d.get("descripcion", "")) or o.description,
+        postulado_detectado=True if d.get("postulado") == "1" else o.postulado_detectado,
+    )
 
 
 def set_source_ok(source: str) -> None:
@@ -621,6 +724,7 @@ def run_cycle() -> int:
 
     new_count = 0
     for o in dedup(found):
+        o = enriquecer_oferta(o)
         job_id, applied_status, op = upsert_job(o)
         if op != "inserted":
             continue
@@ -638,7 +742,8 @@ def main() -> None:
     enviar(
         "🚀 Bot empleos Osorno activo\n"
         "Fuentes: Chiletrabajos, BNE, Indeed, Computrabajo, Yapo\n"
-        "Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO"
+        "Comandos: /postule CODIGO | /nopostule CODIGO | /estado CODIGO\n"
+        f"Intervalo: {INTERVALO}s | Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}"
     )
     while True:
         start = time.time()
