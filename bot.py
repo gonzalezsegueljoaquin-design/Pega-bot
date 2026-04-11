@@ -850,16 +850,55 @@ def parse_generic_source(
 
 def parse_computrabajo() -> List[Oferta]:
     """
-    Computrabajo CL — city-specific URL for Osorno.
-    FIX: pass base_url so relative hrefs are resolved; location_verified=True.
+    Computrabajo CL — individual job listings for Osorno only.
+
+    Computrabajo URL anatomy:
+      - Individual listing: /ofertas-de-trabajo/oferta-de-trabajo-de-<slug>-<HASH>.html
+        The HASH is a 10-char alphanumeric ID, e.g. "de597a9e7f"
+      - Search/category page: /trabajo-de-<slug>-en-<city>  (no .html, no hash)
+
+    We ONLY accept URLs that end with a hex-like hash + .html so search result
+    pages, pagination links, and category indexes are all rejected.
     """
-    return parse_generic_source(
-        source="Computrabajo",
-        url="https://cl.computrabajo.com/empleos-en-los-lagos-en-osorno",
-        must_have=(),          # URL already filters by city; no extra token needed
-        base_url="https://cl.computrabajo.com",
-        location_verified=True,
-    )
+    source = "Computrabajo"
+    if should_cooldown(source):
+        return []
+
+    BASE = "https://cl.computrabajo.com"
+    # Matches Computrabajo listing URLs: ends with -<10+ hex chars>.html
+    RE_LISTING = re.compile(r"-[0-9a-f]{8,}\.html?$", re.I)
+
+    urls = [
+        f"{BASE}/empleos-en-los-lagos-en-osorno",
+        f"{BASE}/empleos-en-los-lagos-en-osorno?p=2",
+    ]
+
+    out: List[Oferta] = []
+    try:
+        for u in urls:
+            soup = get_soup(u, retries=3)
+            if not soup:
+                continue
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                if not href:
+                    continue
+                # Must be an individual listing URL
+                if not RE_LISTING.search(href.lower()):
+                    continue
+                text = limpiar(a.get_text(" "))
+                if len(text) < 6:
+                    continue
+                link = href if href.startswith("http") else f"{BASE}{href}"
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+        set_source_ok(source)
+        log.debug("Computrabajo: %s ofertas individuales encontradas", len(out))
+        return dedup(out)
+    except Exception as e:
+        c = set_source_error(source, str(e))
+        if c in (1, 3, 5):
+            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+        return []
 
 
 def parse_yapo() -> List[Oferta]:
