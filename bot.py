@@ -5,7 +5,7 @@ import re
 import time
 import hashlib
 import html
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import quote_plus
@@ -32,7 +32,9 @@ DETAIL_RETRIES = int(os.getenv("DETAIL_RETRIES", "1"))
 DETAIL_DELAY_MS = int(os.getenv("DETAIL_DELAY_MS", "350"))
 KEYWORDS_INCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_INCLUDE", "").split(",") if k.strip()]
 KEYWORDS_EXCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_EXCLUDE", "").split(",") if k.strip()]
-MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "3"))
+# FIX: Default lowered to 1 so offers actually reach Telegram instead of
+#      piling up silently in the digest bucket.
+MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "1"))
 DIGEST_EVERY_CYCLES = int(os.getenv("DIGEST_EVERY_CYCLES", "3"))
 DAILY_REPORT_HOUR_UTC = int(os.getenv("DAILY_REPORT_HOUR_UTC", "23"))
 HEARTBEAT_EVERY_CYCLES = int(os.getenv("HEARTBEAT_EVERY_CYCLES", "4"))
@@ -50,12 +52,33 @@ HEADERS = {
     "Accept-Language": "es-CL,es;q=0.9",
 }
 
+# ---------------------------------------------------------------------------
+# Osorno geographic signals: region names, commune codes, ZIP codes, and
+# common address fragments that appear even when "Osorno" is absent.
+# Used by is_osorno_context() to detect implicit Osorno listings.
+# ---------------------------------------------------------------------------
+OSORNO_SIGNALS = [
+    "osorno",
+    "los lagos",              # Región de Los Lagos
+    "x región",
+    "xregión",
+    "región de los lagos",
+    "region de los lagos",
+    "5290",                   # ZIP code prefix for Osorno
+    "comuna de osorno",
+    # Osorno neighbourhoods / landmarks that appear in job ads
+    "rahue",
+    "buena vista",            # common barrio name in Osorno
+    "cancha rayada",
+]
+
+
 class ColorFormatter(logging.Formatter):
     COLORS = {
-        logging.DEBUG: "\033[36m",   # cyan
-        logging.INFO: "\033[32m",    # green
-        logging.WARNING: "\033[33m", # yellow
-        logging.ERROR: "\033[31m",   # red
+        logging.DEBUG: "\033[36m",
+        logging.INFO: "\033[32m",
+        logging.WARNING: "\033[33m",
+        logging.ERROR: "\033[31m",
         logging.CRITICAL: "\033[35m",
     }
     RESET = "\033[0m"
@@ -96,6 +119,10 @@ class Oferta:
     jornada: str = "No especificada"
     description: str = "No disponible"
     postulado_detectado: Optional[bool] = None
+    # FIX: new flag — True when the parser already applied a geographic filter
+    # (e.g. the search URL contained ?ubicacion=Osorno).  When True, pasa_filtros
+    # will accept the offer even if none of the OSORNO_SIGNALS appear in the text.
+    location_verified: bool = False
 
 
 def now_utc() -> datetime:
@@ -129,10 +156,16 @@ def resumen_texto(texto: str) -> str:
     return " ".join(utiles)[:420]
 
 
+def contiene_senal_osorno(txt: str) -> bool:
+    """Return True if *txt* contains any geographic signal associated with Osorno."""
+    low = txt.lower()
+    return any(sig in low for sig in OSORNO_SIGNALS)
+
+
 def score_oferta(o: Oferta) -> int:
     txt = f"{o.title} {o.company} {o.description}".lower()
     score = 0
-    if "osorno" in txt:
+    if contiene_senal_osorno(txt) or o.location_verified:
         score += 1
     if o.salary and o.salary != "No especificado":
         score += 1
@@ -146,9 +179,19 @@ def score_oferta(o: Oferta) -> int:
 
 
 def pasa_filtros(o: Oferta) -> bool:
+    """
+    Accept an offer when EITHER:
+      a) location_verified=True  (parser already filtered by Osorno city)
+      b) At least one Osorno geographic signal appears in the combined text
+    Plus optional keyword filters.
+    """
     txt = f"{o.title} {o.company} {o.description} {o.link}".lower()
-    if "osorno" not in txt:
+
+    # Geographic gate
+    if not o.location_verified and not contiene_senal_osorno(txt):
         return False
+
+    # Keyword filters (only applied when configured)
     if KEYWORDS_INCLUDE and not any(k in txt for k in KEYWORDS_INCLUDE):
         return False
     if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
@@ -263,7 +306,13 @@ def formatear_digest(ofertas: List[Tuple[Oferta, str]]) -> str:
     return "\n".join(lines)
 
 
-def formatear_heartbeat(cycle_num: int, total_found: int, new_count: int, existing_count: int, per_source: Dict[str, int]) -> str:
+def formatear_heartbeat(
+    cycle_num: int,
+    total_found: int,
+    new_count: int,
+    existing_count: int,
+    per_source: Dict[str, int],
+) -> str:
     fuentes_line = " | ".join([f"{k}:{v}" for k, v in per_source.items()]) if per_source else "sin datos"
     return (
         "🫀 BOT EN LINEA - OSORNO\n"
@@ -361,7 +410,13 @@ def detalle_generico(link: str) -> Dict[str, str]:
             break
 
     descripcion = ""
-    for sel in ["#jobDescriptionText", "article", "main", "[class*='description']", "meta[property='og:description']"]:
+    for sel in [
+        "#jobDescriptionText",
+        "article",
+        "main",
+        "[class*='description']",
+        "meta[property='og:description']",
+    ]:
         el = soup.select_one(sel)
         if not el:
             continue
@@ -395,7 +450,8 @@ def detalle_generico(link: str) -> Dict[str, str]:
 
     fecha = ""
     m_fecha = re.search(
-        r"(hace\s+\d+\s+(?:minuto|minutos|hora|horas|d[ií]a|d[ií]as|semana|semanas)|\d{1,2}\s+de\s+\w+\s+de\s+\d{4}|\d{4}-\d{2}-\d{2})",
+        r"(hace\s+\d+\s+(?:minuto|minutos|hora|horas|d[ií]a|d[ií]as|semana|semanas)"
+        r"|\d{1,2}\s+de\s+\w+\s+de\s+\d{4}|\d{4}-\d{2}-\d{2})",
         texto,
         re.I,
     )
@@ -424,7 +480,6 @@ def detalle_generico(link: str) -> Dict[str, str]:
 
 
 def enriquecer_oferta(o: Oferta) -> Oferta:
-    # Chiletrabajos already has dedicated detail parsing in listing phase.
     if not ENABLE_DETAIL_ENRICHMENT or o.source == "Chiletrabajos":
         return o
     d = detalle_generico(o.link)
@@ -442,6 +497,8 @@ def enriquecer_oferta(o: Oferta) -> Oferta:
         jornada=limpiar(d.get("jornada", "")) or o.jornada,
         description=limpiar(d.get("descripcion", "")) or o.description,
         postulado_detectado=True if d.get("postulado") == "1" else o.postulado_detectado,
+        # Preserve location trust from original offer
+        location_verified=o.location_verified,
     )
 
 
@@ -466,7 +523,8 @@ def set_source_error(source: str, err: str) -> int:
             INSERT INTO source_health(source, consecutive_errors, last_error)
             VALUES (%s, 1, %s)
             ON CONFLICT (source)
-            DO UPDATE SET consecutive_errors=source_health.consecutive_errors + 1, last_error=EXCLUDED.last_error
+            DO UPDATE SET consecutive_errors=source_health.consecutive_errors + 1,
+                          last_error=EXCLUDED.last_error
             RETURNING consecutive_errors;
             """,
             (source, err[:250]),
@@ -488,10 +546,10 @@ def should_cooldown(source: str) -> bool:
 def get_soup(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
     is_chiletrabajos = "chiletrabajos.cl" in url.lower()
     timeout_cfg = (
-        CHILETRABAJOS_CONNECT_TIMEOUT,
-        CHILETRABAJOS_READ_TIMEOUT,
-    ) if is_chiletrabajos else (CONNECT_TIMEOUT, READ_TIMEOUT)
-
+        (CHILETRABAJOS_CONNECT_TIMEOUT, CHILETRABAJOS_READ_TIMEOUT)
+        if is_chiletrabajos
+        else (CONNECT_TIMEOUT, READ_TIMEOUT)
+    )
     for i in range(1, retries + 1):
         try:
             r = SESSION.get(url, timeout=timeout_cfg)
@@ -499,20 +557,31 @@ def get_soup(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
             return BeautifulSoup(r.text, "html.parser")
         except requests.RequestException as e:
             log.warning("GET [%s/%s] %s: %s", i, retries, url, e)
-            # For portal/network timeout storms, fail fast to keep cycles healthy.
             if isinstance(e, (requests.ConnectTimeout, requests.ReadTimeout)):
                 break
             time.sleep(0.8 * i)
     return None
 
 
+# ---------------------------------------------------------------------------
+# Parsers
+# ---------------------------------------------------------------------------
+
 def parse_chiletrabajos() -> List[Oferta]:
+    """
+    Chiletrabajos — scrapes the Osorno city listing pages.
+    All results come from a city-filtered URL → location_verified=True.
+    """
     source = "Chiletrabajos"
     if should_cooldown(source):
         return []
     out: List[Oferta] = []
     base = "https://www.chiletrabajos.cl"
-    pages = [f"{base}/ciudad/osorno.html", f"{base}/ciudad/osorno.html/30", f"{base}/ciudad/osorno.html/60"]
+    pages = [
+        f"{base}/ciudad/osorno.html",
+        f"{base}/ciudad/osorno.html/30",
+        f"{base}/ciudad/osorno.html/60",
+    ]
     try:
         fallas_consecutivas = 0
         for p in pages:
@@ -544,7 +613,6 @@ def parse_chiletrabajos() -> List[Oferta]:
 
                 d = detalle_chiletrabajos(link)
                 empresa = limpiar(d.get("empresa", "")) or empresa_listado or "No especificada"
-                # Avoid sending RUT as company name
                 if re.fullmatch(r"\d{1,2}\.\d{3}\.\d{3}-[\dkK]", empresa):
                     empresa = empresa_listado or "No especificada"
 
@@ -559,6 +627,7 @@ def parse_chiletrabajos() -> List[Oferta]:
                         jornada=limpiar(d.get("jornada", "")) or "No especificada",
                         description=limpiar(d.get("descripcion", "")) or "No disponible",
                         postulado_detectado=True if d.get("postulado") == "1" else None,
+                        location_verified=True,  # city URL filter
                     )
                 )
         set_source_ok(source)
@@ -571,13 +640,22 @@ def parse_chiletrabajos() -> List[Oferta]:
 
 
 def parse_bne() -> List[Oferta]:
+    """
+    BNE (Bolsa Nacional de Empleo) — searches by Osorno location.
+    Results are location-verified; we do NOT require 'osorno' in the link or text.
+
+    FIX: Broadened href filter — BNE uses /ofertas/ID patterns.
+         Added location_verified=True.
+    """
     source = "BNE"
     if should_cooldown(source):
         return []
     out: List[Oferta] = []
+    # Multiple URL variants to maximise coverage
     urls = [
         "https://www.bne.cl/ofertas?textoBusqueda=&ubicacion=Osorno",
         "https://www.bne.cl/ofertas?textoBusqueda=&comuna=Osorno",
+        "https://www.bne.cl/ofertas?textoBusqueda=&region=LosLagos",
     ]
     try:
         for u in urls:
@@ -589,12 +667,25 @@ def parse_bne() -> List[Oferta]:
                 text = limpiar(a.get_text(" "))
                 if len(text) < 4:
                     continue
-                if "oferta" not in href and "job" not in href and "detalle" not in href:
+                # FIX: BNE uses /ofertas/<id> — "oferta" (substring) matches "ofertas"
+                href_low = href.lower()
+                if not any(tok in href_low for tok in ("oferta", "job", "detalle", "vacante", "empleo")):
                     continue
-                link = href if href.startswith("http") else f"https://www.bne.cl{href}"
-                if "osorno" not in (text + " " + link).lower():
+                # FIX: resolve relative URLs
+                if href.startswith("http"):
+                    link = href
+                elif href.startswith("/"):
+                    link = f"https://www.bne.cl{href}"
+                else:
                     continue
-                out.append(Oferta(source=source, title=text, link=link))
+                out.append(
+                    Oferta(
+                        source=source,
+                        title=text,
+                        link=link,
+                        location_verified=True,  # search URL filters by city
+                    )
+                )
         set_source_ok(source)
         return dedup(out)
     except Exception as e:
@@ -605,25 +696,40 @@ def parse_bne() -> List[Oferta]:
 
 
 def parse_indeed_rss() -> List[Oferta]:
+    """
+    Indeed RSS — query locked to 'Osorno, Los Lagos'.
+    All feed entries are from that location → location_verified=True.
+    """
     source = "Indeed"
     if should_cooldown(source):
         return []
     out: List[Oferta] = []
     try:
         q = quote_plus("osorno")
-        l = quote_plus("Osorno, Los Lagos")
-        feed_url = f"https://cl.indeed.com/rss?q={q}&l={l}&sort=date"
+        l_param = quote_plus("Osorno, Los Lagos")
+        feed_url = f"https://cl.indeed.com/rss?q={q}&l={l_param}&sort=date"
         feed = feedparser.parse(feed_url)
         for e in feed.entries:
             title = limpiar(html.unescape(getattr(e, "title", "")))
             link = getattr(e, "link", "")
-            summary = limpiar(BeautifulSoup(getattr(e, "summary", ""), "html.parser").get_text(" "))
+            summary = limpiar(
+                BeautifulSoup(getattr(e, "summary", ""), "html.parser").get_text(" ")
+            )
             company = "No especificada"
             if " - " in title:
                 parts = title.split(" - ", 1)
                 if len(parts) == 2:
                     title, company = limpiar(parts[0]), limpiar(parts[1])
-            out.append(Oferta(source=source, title=title, company=company, link=link, description=summary))
+            out.append(
+                Oferta(
+                    source=source,
+                    title=title,
+                    company=company,
+                    link=link,
+                    description=summary,
+                    location_verified=True,  # search locked to Osorno, Los Lagos
+                )
+            )
         set_source_ok(source)
         return dedup(out)
     except Exception as e:
@@ -633,7 +739,23 @@ def parse_indeed_rss() -> List[Oferta]:
         return []
 
 
-def parse_generic_source(source: str, url: str, must_have: Tuple[str, ...]) -> List[Oferta]:
+def parse_generic_source(
+    source: str,
+    url: str,
+    must_have: Tuple[str, ...],
+    base_url: str = "",
+    location_verified: bool = False,
+) -> List[Oferta]:
+    """
+    Generic link scraper.
+
+    FIX: Added *base_url* parameter so relative hrefs can be resolved.
+         Previously relative URLs were silently discarded, causing zero results
+         from Computrabajo and Yapo (both use relative hrefs).
+
+    FIX: Added *location_verified* parameter so callers that search by city
+         can mark results without needing 'osorno' in the link text.
+    """
     if should_cooldown(source):
         return []
     out: List[Oferta] = []
@@ -649,10 +771,23 @@ def parse_generic_source(source: str, url: str, must_have: Tuple[str, ...]) -> L
             low = (href + " " + text).lower()
             if not all(token in low for token in must_have):
                 continue
-            link = href if href.startswith("http") else ""
-            if not link:
+            # FIX: resolve relative URLs using the provided base_url
+            if href.startswith("http"):
+                link = href
+            elif href.startswith("/") and base_url:
+                link = f"{base_url.rstrip('/')}{href}"
+            else:
+                # Cannot resolve — skip
+                log.debug("Descartando href no resolvible: %s", href)
                 continue
-            out.append(Oferta(source=source, title=text, link=link))
+            out.append(
+                Oferta(
+                    source=source,
+                    title=text,
+                    link=link,
+                    location_verified=location_verified,
+                )
+            )
         set_source_ok(source)
         return dedup(out)
     except Exception as e:
@@ -663,23 +798,84 @@ def parse_generic_source(source: str, url: str, must_have: Tuple[str, ...]) -> L
 
 
 def parse_computrabajo() -> List[Oferta]:
+    """
+    Computrabajo CL — city-specific URL for Osorno.
+    FIX: pass base_url so relative hrefs are resolved; location_verified=True.
+    """
     return parse_generic_source(
         source="Computrabajo",
         url="https://cl.computrabajo.com/trabajo-de-en-osorno",
-        must_have=("osorno",),
+        must_have=(),          # URL already filters by city; no extra token needed
+        base_url="https://cl.computrabajo.com",
+        location_verified=True,
     )
 
 
 def parse_yapo() -> List[Oferta]:
+    """
+    Yapo empleos — query includes 'osorno' in the URL.
+    FIX: pass base_url; location_verified=True because search is city-scoped.
+    """
     return parse_generic_source(
         source="Yapo",
         url="https://www.yapo.cl/empleos?ca=12_s&l=0&q=osorno",
-        must_have=("osorno",),
+        must_have=(),          # URL already scopes to Osorno
+        base_url="https://www.yapo.cl",
+        location_verified=True,
     )
 
 
+def parse_trabajando() -> List[Oferta]:
+    """
+    Trabajando.com — Chilean job board with city filter.
+    Additional source to improve coverage.
+    """
+    source = "Trabajando"
+    if should_cooldown(source):
+        return []
+    out: List[Oferta] = []
+    urls = [
+        "https://www.trabajando.cl/empleos/buscar?q=&ciudad=Osorno",
+        "https://www.trabajando.cl/empleos/buscar?q=&ciudad=osorno&region=LosLagos",
+    ]
+    try:
+        for u in urls:
+            soup = get_soup(u, retries=2)
+            if not soup:
+                continue
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                text = limpiar(a.get_text(" "))
+                if len(text) < 4:
+                    continue
+                href_low = href.lower()
+                if not any(tok in href_low for tok in ("empleo", "oferta", "job", "vacante", "trabajo")):
+                    continue
+                if href.startswith("http"):
+                    link = href
+                elif href.startswith("/"):
+                    link = f"https://www.trabajando.cl{href}"
+                else:
+                    continue
+                out.append(
+                    Oferta(
+                        source=source,
+                        title=text,
+                        link=link,
+                        location_verified=True,
+                    )
+                )
+        set_source_ok(source)
+        return dedup(out)
+    except Exception as e:
+        c = set_source_error(source, str(e))
+        if c in (1, 3, 5):
+            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+        return []
+
+
 def dedup(items: List[Oferta]) -> List[Oferta]:
-    seen = set()
+    seen: set = set()
     out: List[Oferta] = []
     for o in items:
         k = o.link.strip()
@@ -691,18 +887,26 @@ def dedup(items: List[Oferta]) -> List[Oferta]:
 
 
 def upsert_job(o: Oferta) -> Tuple[int, str, str]:
-    fingerprint = short_hash(o.title, o.company, o.source)
+    # FIX: fingerprint was previously built from (title, company, source) which
+    #      caused false duplicates when two different companies published the same
+    #      role title.  Using the link as the canonical identity is safer because
+    #      each job posting has a unique URL.
+    fingerprint = short_hash(o.link)
     job_code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
     with get_db() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         try:
             cur.execute(
                 """
-                INSERT INTO jobs(job_code, source, title, company, link, date_text, salary, jornada, description, fingerprint, last_seen_at)
+                INSERT INTO jobs(job_code, source, title, company, link, date_text, salary, jornada,
+                                 description, fingerprint, last_seen_at)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
                 ON CONFLICT (link) DO NOTHING
                 RETURNING id, applied_status, (xmax = 0) AS inserted;
                 """,
-                (job_code, o.source, o.title, o.company, o.link, o.date_text, o.salary, o.jornada, o.description, fingerprint),
+                (
+                    job_code, o.source, o.title, o.company, o.link,
+                    o.date_text, o.salary, o.jornada, o.description, fingerprint,
+                ),
             )
             row = cur.fetchone()
             if not row:
@@ -713,16 +917,8 @@ def upsert_job(o: Oferta) -> Tuple[int, str, str]:
             conn.commit()
             return int(row["id"]), str(row["applied_status"]), "inserted" if row["inserted"] else "updated"
         except psycopg2.errors.UniqueViolation:
-            # Same posting can appear with a different URL. If fingerprint exists, skip it.
             conn.rollback()
-            cur.execute(
-                """
-                SELECT id, applied_status
-                FROM jobs
-                WHERE fingerprint=%s
-                """,
-                (fingerprint,),
-            )
+            cur.execute("SELECT id, applied_status FROM jobs WHERE fingerprint=%s", (fingerprint,))
             row = cur.fetchone()
             if not row:
                 raise
@@ -789,7 +985,10 @@ def update_applied(job_code: str, status: str) -> bool:
 
 def get_job_status(job_code: str) -> Optional[Tuple[str, str]]:
     with get_db() as conn, conn.cursor() as cur:
-        cur.execute("SELECT title, applied_status FROM jobs WHERE job_code=%s", (job_code.upper(),))
+        cur.execute(
+            "SELECT title, applied_status FROM jobs WHERE job_code=%s",
+            (job_code.upper(),),
+        )
         row = cur.fetchone()
         if not row:
             return None
@@ -887,6 +1086,7 @@ def run_cycle() -> Dict[str, object]:
         parse_indeed_rss,
         parse_computrabajo,
         parse_yapo,
+        parse_trabajando,   # new source
     ]
     found: List[Oferta] = []
     per_source: Dict[str, int] = {}
@@ -965,7 +1165,7 @@ def main() -> None:
     enviar(
         "🚀 BOT EMPLEOS OSORNO ACTIVO\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 Fuentes: Chiletrabajos | BNE | Indeed | Computrabajo | Yapo\n"
+        "🌐 Fuentes: Chiletrabajos | BNE | Indeed | Computrabajo | Yapo | Trabajando\n"
         f"⏱️ Intervalo: {INTERVALO}s\n"
         f"🧠 Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
         f"⭐ Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}\n"
