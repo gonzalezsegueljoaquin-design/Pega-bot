@@ -249,24 +249,75 @@ def init_db() -> None:
         conn.commit()
 
 
-def telegram_api(method: str, payload: Dict) -> Dict:
+# Global rate-limit state: bot will not call Telegram before this epoch second.
+# Shared across all telegram_api() calls so a 429 on one send automatically
+# throttles every subsequent send in the same process.
+_tg_retry_after_until: float = 0.0
+
+
+def telegram_api(method: str, payload: Dict, _retries: int = 5) -> Dict:
+    """
+    Call a Telegram Bot API method with automatic 429 back-off.
+
+    Strategy:
+    - Before every attempt, check the global cooldown and sleep if needed.
+    - On 429, read retry_after from the response, update the global cooldown,
+      and retry (up to _retries times).
+    - On any other non-OK response, raise immediately.
+    - If all retries are exhausted due to 429, raise so the caller can decide
+      whether to drop the message or log the failure.
+    """
+    global _tg_retry_after_until
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
-    r = SESSION.post(url, data=payload, timeout=TIMEOUT)
-    try:
-        data = r.json()
-    except Exception:
-        data = {"ok": False, "description": r.text[:300]}
-    if not r.ok or not data.get("ok"):
-        raise RuntimeError(f"Telegram {method} fallo: {data}")
-    return data
+
+    for attempt in range(1, _retries + 1):
+        # Honour global cooldown before sending
+        remaining = _tg_retry_after_until - time.time()
+        if remaining > 0:
+            log.warning("Telegram rate-limit activo — esperando %.0fs antes de %s", remaining, method)
+            time.sleep(remaining)
+
+        r = SESSION.post(url, data=payload, timeout=TIMEOUT)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "description": r.text[:300]}
+
+        # 429 — Too Many Requests
+        if r.status_code == 429 or data.get("error_code") == 429:
+            retry_after = int(data.get("parameters", {}).get("retry_after", 30))
+            retry_after = min(retry_after, 600)  # cap at 10 min — avoid hanging forever
+            _tg_retry_after_until = time.time() + retry_after + 2  # +2 s buffer
+            log.warning(
+                "Telegram 429 en %s (intento %s/%s) — retry_after=%ss",
+                method, attempt, _retries, retry_after,
+            )
+            if attempt < _retries:
+                time.sleep(retry_after + 2)
+                continue
+            raise RuntimeError(
+                f"Telegram {method} fallo tras {_retries} intentos por rate-limit (429)"
+            )
+
+        if not r.ok or not data.get("ok"):
+            raise RuntimeError(f"Telegram {method} fallo: {data}")
+        return data
+
+    raise RuntimeError(f"Telegram {method} sin reintentos disponibles")
 
 
 def enviar(msg: str) -> Optional[int]:
+    """Send a Telegram message. Errors are logged but never propagate to the
+    caller — a failed notification must never crash a scraping cycle."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("Faltan TELEGRAM_TOKEN/TELEGRAM_CHAT_ID")
         return None
-    data = telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:MAX_MSG]})
-    return data.get("result", {}).get("message_id")
+    try:
+        data = telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": msg[:MAX_MSG]})
+        return data.get("result", {}).get("message_id")
+    except RuntimeError as exc:
+        log.error("enviar() fallo permanentemente — mensaje descartado: %s", exc)
+        return None
 
 
 def format_estado(status: str) -> str:
@@ -813,16 +864,125 @@ def parse_computrabajo() -> List[Oferta]:
 
 def parse_yapo() -> List[Oferta]:
     """
-    Yapo empleos — query includes 'osorno' in the URL.
-    FIX: pass base_url; location_verified=True because search is city-scoped.
+    Yapo empleos — Osorno job listings only.
+
+    Yapo is a general classifieds site (arriendos, autos, servicios, etc.).
+    We apply three layers of filtering to return only job postings:
+
+    Layer 1 — URL must look like a real job listing:
+        Yapo listing URLs follow the pattern /<category>/<slug>-<numeric-id>.htm
+        We require the numeric-id + .htm suffix AND that the path starts with
+        a job-related category slug.  Navigation/filter links don't match this.
+
+    Layer 2 — URL must NOT belong to a non-job category path:
+        Hard-reject any href whose path contains known non-job slugs.
+
+    Layer 3 — Title sanity check:
+        Navigation labels, breadcrumbs, and button texts are usually very short
+        or match known UI strings.  Require at least 6 characters and reject
+        obvious non-job labels.
     """
-    return parse_generic_source(
-        source="Yapo",
-        url="https://www.yapo.cl/empleos?ca=12_s&l=0&q=osorno",
-        must_have=(),          # URL already scopes to Osorno
-        base_url="https://www.yapo.cl",
-        location_verified=True,
+    source = "Yapo"
+    if should_cooldown(source):
+        return []
+
+    BASE = "https://www.yapo.cl"
+
+    # Layer 1 — must match: a known job category path AND end with digits + .htm
+    # Yapo job category slugs observed in practice:
+    JOB_CATEGORY_SLUGS = (
+        "/empleos/",
+        "/trabajo/",
+        "/oferta-laboral/",
+        "/empleo/",
     )
+    # Regex: path ends with one or more digits followed by .htm (or .html)
+    RE_LISTING_ID = re.compile(r"\d+\.html?$")
+
+    # Layer 2 — hard-reject these category path prefixes
+    REJECT_SLUGS = (
+        "/arriendo", "/venta", "/compra",
+        "/autos", "/motos", "/vehiculo",
+        "/servicios", "/servicio",
+        "/inmueble", "/propiedad", "/casa-en-",
+        "/electronico", "/electrónico", "/computacion",
+        "/moda", "/ropa",
+        "/deporte", "/recreacion",
+        "/mascota", "/animal",
+        "/hogar", "/mueble",
+        "/regalo", "/gratis",
+    )
+
+    # Layer 3 — reject titles that match common UI/navigation strings
+    REJECT_TITLE_PATTERNS = re.compile(
+        r"^(ver m[aá]s|publicar|iniciar sesi[oó]n|registrar|subir|buscar|"
+        r"filtrar|ordenar|anterior|siguiente|p[aá]gina|volver|inicio|"
+        r"mi cuenta|ayuda|contacto|\d+\s*(resultados|anuncios))$",
+        re.I,
+    )
+
+    urls = [
+        f"{BASE}/empleos?ca=12_s&l=0&q=osorno",
+        f"{BASE}/empleos?ca=12_s&l=0&q=osorno&o=25",
+        f"{BASE}/empleos?ca=12_s&l=0&q=osorno&o=50",
+    ]
+
+    out: List[Oferta] = []
+    try:
+        for u in urls:
+            soup = get_soup(u, retries=2)
+            if not soup:
+                continue
+
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                if not href:
+                    continue
+                href_low = href.lower()
+
+                # Layer 1 — must end with <digits>.htm[l]
+                if not RE_LISTING_ID.search(href_low):
+                    continue
+                # Layer 1 — must belong to a job category path
+                if not any(slug in href_low for slug in JOB_CATEGORY_SLUGS):
+                    continue
+
+                # Layer 2 — reject non-job categories
+                if any(slug in href_low for slug in REJECT_SLUGS):
+                    continue
+
+                # Layer 3 — title sanity
+                text = limpiar(a.get_text(" "))
+                if len(text) < 6:
+                    continue
+                if REJECT_TITLE_PATTERNS.match(text):
+                    continue
+
+                # Resolve URL
+                if href.startswith("http"):
+                    link = href
+                elif href.startswith("/"):
+                    link = f"{BASE}{href}"
+                else:
+                    continue
+
+                out.append(
+                    Oferta(
+                        source=source,
+                        title=text,
+                        link=link,
+                        location_verified=True,  # search URL already scoped to Osorno
+                    )
+                )
+
+        set_source_ok(source)
+        log.debug("Yapo: %s ofertas de empleo encontradas", len(out))
+        return dedup(out)
+    except Exception as e:
+        c = set_source_error(source, str(e))
+        if c in (1, 3, 5):
+            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+        return []
 
 
 def parse_trabajando() -> List[Oferta]:
