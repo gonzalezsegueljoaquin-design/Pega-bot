@@ -855,7 +855,7 @@ def parse_computrabajo() -> List[Oferta]:
     """
     return parse_generic_source(
         source="Computrabajo",
-        url="https://cl.computrabajo.com/trabajo-de-en-osorno",
+        url="https://cl.computrabajo.com/empleos-en-los-lagos-en-osorno",
         must_have=(),          # URL already filters by city; no extra token needed
         base_url="https://cl.computrabajo.com",
         location_verified=True,
@@ -987,16 +987,16 @@ def parse_yapo() -> List[Oferta]:
 
 def parse_trabajando() -> List[Oferta]:
     """
-    Trabajando.com — Chilean job board with city filter.
-    Additional source to improve coverage.
+    Trabajando.com — Chilean job board.
+    Correct URL confirmed: trabajando.cl/trabajo-osorno
     """
     source = "Trabajando"
     if should_cooldown(source):
         return []
     out: List[Oferta] = []
     urls = [
-        "https://www.trabajando.cl/empleos/buscar?q=&ciudad=Osorno",
-        "https://www.trabajando.cl/empleos/buscar?q=&ciudad=osorno&region=LosLagos",
+        "https://www.trabajando.cl/trabajo-osorno",
+        "https://www.trabajando.cl/trabajo-osorno/pagina-2",
     ]
     try:
         for u in urls:
@@ -1006,7 +1006,7 @@ def parse_trabajando() -> List[Oferta]:
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
                 text = limpiar(a.get_text(" "))
-                if len(text) < 4:
+                if len(text) < 6:
                     continue
                 href_low = href.lower()
                 if not any(tok in href_low for tok in ("empleo", "oferta", "job", "vacante", "trabajo")):
@@ -1017,14 +1017,53 @@ def parse_trabajando() -> List[Oferta]:
                     link = f"https://www.trabajando.cl{href}"
                 else:
                     continue
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+        set_source_ok(source)
+        return dedup(out)
+    except Exception as e:
+        c = set_source_error(source, str(e))
+        if c in (1, 3, 5):
+            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+        return []
+
+
+def parse_acciontrabajo() -> List[Oferta]:
+    """
+    Acciontrabajo.com — Chilean classifieds job board with Osorno listings.
+    URL confirmed: cl.acciontrabajo.com/trabajo/osorno
+    """
+    source = "Acciontrabajo"
+    if should_cooldown(source):
+        return []
+    out: List[Oferta] = []
+    urls = [
+        "https://cl.acciontrabajo.com/trabajo/osorno",
+        "https://cl.acciontrabajo.com/trabajo/osorno/pagina-2",
+    ]
+    try:
+        for u in urls:
+            soup = get_soup(u, retries=2)
+            if not soup:
+                continue
+            for a in soup.select("a[href]"):
+                href = a.get("href", "")
+                text = limpiar(a.get_text(" "))
+                if len(text) < 6:
+                    continue
+                href_low = href.lower()
+                # Acciontrabajo listing URLs contain /trabajo/ or /empleo/ or a numeric ID
+                if not any(tok in href_low for tok in ("/trabajo/", "/empleo/", "/oferta/")):
+                    continue
+                # Skip search/filter/pagination links
+                if any(tok in href_low for tok in ("/buscar", "/filtro", "/categoria", "/region")):
+                    continue
+                if href.startswith("http"):
+                    link = href
+                elif href.startswith("/"):
+                    link = f"https://cl.acciontrabajo.com{href}"
+                else:
+                    continue
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
         set_source_ok(source)
         return dedup(out)
     except Exception as e:
@@ -1246,7 +1285,8 @@ def run_cycle() -> Dict[str, object]:
         parse_indeed_rss,
         parse_computrabajo,
         parse_yapo,
-        parse_trabajando,   # new source
+        parse_trabajando,
+        parse_acciontrabajo,
     ]
     found: List[Oferta] = []
     per_source: Dict[str, int] = {}
@@ -1325,7 +1365,7 @@ def main() -> None:
     enviar(
         "🚀 BOT EMPLEOS OSORNO ACTIVO\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 Fuentes: Chiletrabajos | BNE | Indeed | Computrabajo | Yapo | Trabajando\n"
+        "🌐 Fuentes: Chiletrabajos | BNE | Indeed | Computrabajo | Yapo | Trabajando | Acciontrabajo\n"
         f"⏱️ Intervalo: {INTERVALO}s\n"
         f"🧠 Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
         f"⭐ Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}\n"
