@@ -5,7 +5,7 @@ import re
 import time
 import hashlib
 import html
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple, Set
 from urllib.parse import quote_plus, urljoin
@@ -14,7 +14,7 @@ import feedparser
 import psycopg2
 import psycopg2.extras
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 
 
 INTERVALO = int(os.getenv("INTERVALO", "45"))
@@ -62,6 +62,23 @@ OSORNO_SIGNALS = [
     "rahue",
     "buena vista",
     "cancha rayada",
+]
+
+# Palabras/frases de basura comunes en descripciones
+NOISE_PATTERNS = [
+    r'\bPUBLICIDAD\b',
+    r'\b(Home|Volver|Buscar Ofertas|Ofertas relacionadas|Más ofertas|Guardar|Postular)\b',
+    r'\bDetalle oferta\b',
+    r'\bID\s+\d+\b',
+    r'\bBuscado\s+[\w\s]+\b(?=Fecha)',
+    r'\bFecha\s+\d{4}-\d{2}-\d{2}',
+    r'\bExpira\s+\d{4}-\d{2}-\d{2}',
+    r'\bUbicación\s+[\w\s]+\b(?=Categoría)',
+    r'\bCategoría\s+[\w\s]+\b(?=Duración)',
+    r'\bDuración\s+[\w\s]+\b(?=Tipo)',
+    r'\bTipo\s+[\w\s-]+\b(?=Postular)',
+    r'\ben\s+\d+\s+días?\)',
+    r'Compartir en.*?(?:\n|$)',
 ]
 
 
@@ -122,27 +139,58 @@ def limpiar(txt: str) -> str:
     return re.sub(r"\s+", " ", str(txt or "")).strip()
 
 
+def limpiar_descripcion(txt: str) -> str:
+    """Limpia basura de descripciones (navegación, ads, metadata)"""
+    limpio = limpiar(txt)
+    
+    # Remover patrones de basura
+    for pattern in NOISE_PATTERNS:
+        limpio = re.sub(pattern, '', limpio, flags=re.IGNORECASE)
+    
+    # Remover líneas muy cortas (navegación)
+    lines = [l.strip() for l in limpio.split('\n') if len(l.strip()) > 20]
+    limpio = ' '.join(lines)
+    
+    # Limpieza final
+    limpio = re.sub(r'\s+', ' ', limpio).strip()
+    
+    # Limitar longitud
+    if len(limpio) > MAX_DESC:
+        limpio = limpio[:MAX_DESC].rsplit(' ', 1)[0] + '...'
+    
+    return limpio if limpio else "No disponible"
+
+
 def short_hash(*parts: str) -> str:
     base = limpiar("|".join(parts)).lower()
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:10].upper()
 
 
 def resumen_texto(texto: str) -> str:
-    limpio = limpiar(texto)
-    if not limpio:
+    limpio = limpiar_descripcion(texto)
+    if not limpio or limpio == "No disponible":
         return "No disponible"
-    partes = re.split(r"(?<=[\.\!\?])\s+", limpio)
+    
+    # Tomar primeras 2-3 oraciones significativas
+    oraciones = re.split(r'(?<=[.!?])\s+', limpio)
     utiles: List[str] = []
-    for p in partes:
-        t = limpiar(p)
-        if len(t) < 35:
+    
+    for oracion in oraciones:
+        o = limpiar(oracion)
+        if len(o) < 30:  # Muy corta, probablemente basura
             continue
-        utiles.append(t)
+        utiles.append(o)
         if len(utiles) >= 3:
             break
+    
     if not utiles:
-        return limpio[:280]
-    return " ".join(utiles)[:420]
+        return limpio[:350]
+    
+    resultado = ' '.join(utiles)
+    if len(resultado) > 450:
+        resultado = resultado[:450].rsplit(' ', 1)[0] + '...'
+    
+    return resultado
 
 
 def contiene_senal_osorno(txt: str) -> bool:
@@ -399,92 +447,96 @@ def get_soup(url: str, retries: int = 2) -> Optional[BeautifulSoup]:
     return None
 
 
+def extraer_texto_limpio(element) -> str:
+    """Extrae texto de un elemento removiendo scripts, styles y comentarios"""
+    if not element:
+        return ""
+    
+    # Clonar para no modificar el original
+    elem_copy = element
+    
+    # Remover scripts, styles, y comentarios
+    for script in elem_copy.find_all(['script', 'style', 'nav', 'header', 'footer']):
+        script.decompose()
+    
+    for comment in elem_copy.find_all(string=lambda text: isinstance(text, Comment)):
+        comment.extract()
+    
+    texto = elem_copy.get_text(separator=' ', strip=True)
+    return limpiar(texto)
+
+
 def extraer_detalle_chiletrabajos(link: str) -> Dict[str, str]:
-    """Extrae detalles de una oferta de Chiletrabajos"""
+    """Extrae detalles de Chiletrabajos con limpieza mejorada"""
     soup = get_soup(link, retries=2)
     if not soup:
         return {}
 
-    texto = limpiar(soup.get_text(" "))
-    
-    # Empresa - múltiples selectores
-    empresa = ""
-    for sel in ["[itemprop='hiringOrganization']", ".empresa", "[class*='company']"]:
-        el = soup.select_one(sel)
-        if el:
-            empresa = limpiar(el.get_text(" "))
-            break
-    
-    # Buscar en tablas si no se encontró
-    if not empresa:
+    # Extraer valores de tabla primero
+    def get_table_value(key: str) -> str:
         for td in soup.select("table td"):
             txt = limpiar(td.get_text(" ")).lower()
-            if "empresa" in txt or "buscado" in txt:
+            if key in txt:
                 sib = td.find_next_sibling("td")
                 if sib:
-                    empresa = limpiar(sib.get_text(" "))
-                    break
+                    return limpiar(sib.get_text(" "))
+        return ""
 
-    # Fecha
-    fecha = ""
-    for td in soup.select("table td"):
-        txt = limpiar(td.get_text(" ")).lower()
-        if "fecha" in txt or "publicad" in txt:
-            sib = td.find_next_sibling("td")
-            if sib:
-                fecha = limpiar(sib.get_text(" "))
-                break
+    empresa = get_table_value("buscado") or get_table_value("empresa") or ""
+    fecha = get_table_value("fecha") or ""
+    jornada = get_table_value("tipo") or ""
+    sueldo = get_table_value("salario") or get_table_value("sueldo") or ""
+    
+    if sueldo and not sueldo.startswith("$") and sueldo.lower() not in ("no especificado", "a convenir"):
+        sueldo = f"${sueldo}"
 
-    # Jornada
-    jornada = ""
-    for td in soup.select("table td"):
-        txt = limpiar(td.get_text(" ")).lower()
-        if "tipo" in txt or "jornada" in txt:
-            sib = td.find_next_sibling("td")
-            if sib:
-                jornada = limpiar(sib.get_text(" "))
-                break
-
-    # Sueldo
-    sueldo = ""
-    for td in soup.select("table td"):
-        txt = limpiar(td.get_text(" ")).lower()
-        if "salario" in txt or "sueldo" in txt or "remuneración" in txt:
-            sib = td.find_next_sibling("td")
-            if sib:
-                sueldo = limpiar(sib.get_text(" "))
-                if sueldo and not sueldo.startswith("$"):
-                    sueldo = f"${sueldo}"
-                break
-
-    # Descripción
+    # Descripción - estrategia mejorada
     descripcion = ""
-    for tag in soup.find_all(["h2", "h3", "h4"]):
-        if "descripci" in limpiar(tag.get_text(" ")).lower():
-            bloques: List[str] = []
-            for sib in tag.next_siblings:
-                if getattr(sib, "name", None) in ("h2", "h3", "h4"):
+    
+    # 1. Buscar sección de descripción específica
+    for heading in soup.find_all(['h2', 'h3', 'h4']):
+        heading_text = limpiar(heading.get_text()).lower()
+        if 'descripci' in heading_text or 'detalle' in heading_text or 'funciones' in heading_text:
+            # Extraer contenido después del heading
+            content_parts = []
+            for sibling in heading.next_siblings:
+                if sibling.name in ['h2', 'h3', 'h4']:
                     break
-                if hasattr(sib, "get_text"):
-                    t = limpiar(sib.get_text(" "))
-                    if t:
-                        bloques.append(t)
-            descripcion = limpiar(" ".join(bloques))
-            break
-
-    if not descripcion:
-        for sel in ["article", "main", ".oferta-content", "#oferta", "[class*='description']"]:
-            bloque = soup.select_one(sel)
-            if bloque:
-                descripcion = limpiar(bloque.get_text(" "))
+                if sibling.name in ['p', 'div', 'ul', 'ol']:
+                    txt = extraer_texto_limpio(sibling)
+                    if len(txt) > 20:
+                        content_parts.append(txt)
+            
+            if content_parts:
+                descripcion = ' '.join(content_parts)
                 break
-
+    
+    # 2. Si no encontró, buscar por selectores específicos
     if not descripcion:
-        descripcion = texto[:900]
-
-    postulado = bool(
-        re.search(r"\b(postulado|ya postulaste|postulaci[oó]n enviada|ya aplicaste)\b", texto, re.I)
-    )
+        for selector in ['[class*="description"]', '[class*="detalle"]', 'article', 'main']:
+            elem = soup.select_one(selector)
+            if elem:
+                descripcion = extraer_texto_limpio(elem)
+                if len(descripcion) > 50:
+                    break
+    
+    # 3. Último recurso: texto general pero limpiado
+    if not descripcion:
+        # Remover navegación y basura antes de extraer
+        for basura in soup.select('nav, header, footer, [class*="menu"], [class*="navigation"]'):
+            basura.decompose()
+        descripcion = soup.get_text(separator=' ', strip=True)
+    
+    # Limpiar descripción
+    descripcion = limpiar_descripcion(descripcion)
+    
+    # Detectar postulación
+    texto_completo = soup.get_text().lower()
+    postulado = bool(re.search(
+        r'\b(postulado|ya postulaste|postulaci[oó]n enviada|ya aplicaste)\b',
+        texto_completo,
+        re.I
+    ))
 
     return {
         "empresa": empresa or "No especificada",
@@ -497,15 +549,13 @@ def extraer_detalle_chiletrabajos(link: str) -> Dict[str, str]:
 
 
 def enriquecer_oferta(o: Oferta) -> Oferta:
-    """Enriquece una oferta con detalles adicionales si está habilitado"""
+    """Enriquece una oferta con detalles adicionales"""
     if not ENABLE_DETAIL_ENRICHMENT:
         return o
     
-    # Chiletrabajos ya viene con detalles, skip
     if o.source == "Chiletrabajos":
         return o
     
-    # Para otras fuentes, intentar extraer detalles básicos
     try:
         soup = get_soup(o.link, retries=1)
         if not soup:
@@ -514,73 +564,66 @@ def enriquecer_oferta(o: Oferta) -> Oferta:
         if DETAIL_DELAY_MS > 0:
             time.sleep(DETAIL_DELAY_MS / 1000)
         
-        texto = limpiar(soup.get_text(" "))
-        
         # Título mejorado
         titulo = o.title
-        for sel in ["h1", "meta[property='og:title']", "[class*='job-title']", "[class*='vacancy-title']"]:
+        for sel in ["h1", "[class*='job-title']", "[class*='vacancy-title']", "meta[property='og:title']"]:
             el = soup.select_one(sel)
             if el:
-                t = limpiar(el.get_text(" ")) if el.name != "meta" else limpiar(el.get("content", ""))
-                if len(t) > len(titulo):
+                t = limpiar(el.get_text()) if el.name != "meta" else limpiar(el.get("content", ""))
+                if len(t) > 5:
                     titulo = t
                     break
         
         # Empresa
         empresa = o.company
-        for sel in [
-            "[data-testid='company-name']",
-            "[class*='company-name']",
-            "[class*='employer']",
-            "meta[property='og:site_name']",
-        ]:
+        for sel in ["[class*='company-name']", "[class*='employer']", "[data-testid='company-name']"]:
             el = soup.select_one(sel)
             if el:
-                e = limpiar(el.get_text(" ")) if el.name != "meta" else limpiar(el.get("content", ""))
+                e = limpiar(el.get_text())
                 if e and e != "No especificada":
                     empresa = e
                     break
         
         # Descripción
-        descripcion = o.description
-        for sel in [
-            "#jobDescriptionText",
-            "[class*='job-description']",
-            "[class*='vacancy-description']",
-            "article",
-            "main",
-        ]:
+        descripcion = ""
+        for sel in ["#jobDescriptionText", "[class*='job-description']", "[class*='description']", "article"]:
             el = soup.select_one(sel)
             if el:
-                d = limpiar(el.get_text(" "))
-                if len(d) > 60:
+                d = extraer_texto_limpio(el)
+                if len(d) > 50:
                     descripcion = d
                     break
         
+        if not descripcion:
+            descripcion = extraer_texto_limpio(soup.find("body"))
+        
+        descripcion = limpiar_descripcion(descripcion)
+        
         # Sueldo
         sueldo = o.salary
-        m_sueldo = re.search(r"\$\s*[\d\.\,]+(?:\s*[-–a]\s*\$?\s*[\d\.\,]+)?", texto)
+        texto_soup = soup.get_text()
+        m_sueldo = re.search(r'\$\s*[\d\.\,]+(?:\s*[-–a]\s*\$?\s*[\d\.\,]+)?', texto_soup)
         if m_sueldo:
             sueldo = limpiar(m_sueldo.group(0))
         
         # Fecha
         fecha = o.date_text
         m_fecha = re.search(
-            r"(hace\s+\d+\s+(?:minuto|hora|día|semana)s?"
-            r"|\d{1,2}\s+de\s+\w+\s+(?:de\s+)?\d{4}"
-            r"|\d{4}-\d{2}-\d{2})",
-            texto,
-            re.I,
+            r'(hace\s+\d+\s+(?:minuto|hora|día|semana)s?'
+            r'|\d{1,2}\s+de\s+\w+(?:\s+de\s+)?\d{4}'
+            r'|\d{4}-\d{2}-\d{2})',
+            texto_soup,
+            re.I
         )
         if m_fecha:
             fecha = limpiar(m_fecha.group(0))
         
         # Jornada
         jornada = o.jornada
-        t = texto.lower()
-        if re.search(r"part.?time|jornada parcial|medio tiempo|part-time", t):
+        t = texto_soup.lower()
+        if re.search(r'part.?time|jornada parcial|medio tiempo', t):
             jornada = "Part Time"
-        elif re.search(r"full.?time|jornada completa|tiempo completo|full-time", t):
+        elif re.search(r'full.?time|jornada completa|tiempo completo', t):
             jornada = "Full Time"
         
         return Oferta(
@@ -596,16 +639,16 @@ def enriquecer_oferta(o: Oferta) -> Oferta:
             location_verified=o.location_verified,
         )
     except Exception as e:
-        log.warning("Error enriqueciendo oferta de %s: %s", o.source, e)
+        log.warning("Error enriqueciendo %s: %s", o.source, e)
         return o
 
 
 # =============================================================================
-# PARSERS ESPECÍFICOS POR FUENTE
+# PARSERS POR FUENTE
 # =============================================================================
 
 def parse_chiletrabajos() -> List[Oferta]:
-    """Parser especializado para Chiletrabajos"""
+    """Chiletrabajos - Optimizado"""
     source = "Chiletrabajos"
     if should_cooldown(source):
         log.info("%s en cooldown", source)
@@ -613,56 +656,51 @@ def parse_chiletrabajos() -> List[Oferta]:
     
     out: List[Oferta] = []
     base = "https://www.chiletrabajos.cl"
+    
+    # Aumentar páginas
     pages = [
         f"{base}/ciudad/osorno.html",
         f"{base}/ciudad/osorno.html/30",
         f"{base}/ciudad/osorno.html/60",
+        f"{base}/ciudad/osorno.html/90",
     ]
     
     try:
-        fallas_consecutivas = 0
         for p in pages:
             log.debug("Chiletrabajos: scraping %s", p)
             soup = get_soup(p, retries=2)
             if not soup:
-                fallas_consecutivas += 1
-                if fallas_consecutivas >= 2:
-                    log.warning("Chiletrabajos: corte temprano por timeouts")
-                    break
                 continue
             
-            fallas_consecutivas = 0
-            
-            # Estrategia 1: Buscar H2 con enlaces
+            # Buscar H2 con enlaces a trabajos
             for h2 in soup.find_all("h2"):
                 a = h2.find("a", href=True)
                 if not a:
                     continue
-                href = a["href"]
+                
+                href = a.get("href", "")
                 if "/trabajo/" not in href:
                     continue
                 
                 link = href if href.startswith("http") else f"{base}{href}"
                 title = limpiar(a.get_text())
+                
                 if not title or len(title) < 5:
                     continue
                 
-                # Extraer info de la lista
+                # Info del listado
                 h3 = h2.find_next_sibling("h3")
                 empresa_listado = ""
                 if h3:
-                    empresa_listado = limpiar(h3.get_text(" ").split(",")[0])
+                    empresa_listado = limpiar(h3.get_text().split(",")[0])
                 
-                fecha_listado = ""
-                h3_fecha = h3.find_next_sibling("h3") if h3 else None
-                if h3_fecha:
-                    fecha_listado = limpiar(h3_fecha.get_text(" "))
-                
-                # Extraer detalles completos
+                # Extraer detalles
                 d = extraer_detalle_chiletrabajos(link)
                 
                 empresa = d.get("empresa", empresa_listado) or empresa_listado or "No especificada"
-                if re.fullmatch(r"\d{1,2}\.\d{3}\.\d{3}-[\dkK]", empresa):
+                
+                # Evitar RUTs como empresa
+                if re.fullmatch(r'\d{1,2}\.\d{3}\.\d{3}-[\dkK]', empresa):
                     empresa = empresa_listado or "No especificada"
                 
                 out.append(
@@ -671,16 +709,19 @@ def parse_chiletrabajos() -> List[Oferta]:
                         title=title,
                         link=link,
                         company=empresa,
-                        date_text=d.get("fecha", fecha_listado) or fecha_listado or "No especificada",
-                        salary=d.get("sueldo", "No especificado") or "No especificado",
-                        jornada=d.get("jornada", "No especificada") or "No especificada",
-                        description=d.get("descripcion", "No disponible") or "No disponible",
-                        postulado_detectado=True if d.get("postulado") == "1" else None,
+                        date_text=d.get("fecha", "No especificada"),
+                        salary=d.get("sueldo", "No especificado"),
+                        jornada=d.get("jornada", "No especificada"),
+                        description=d.get("descripcion", "No disponible"),
+                        postulado_detectado=d.get("postulado") == "1",
                         location_verified=True,
                     )
                 )
+                
+                # Delay entre requests
+                time.sleep(0.3)
         
-        log.info("Chiletrabajos: %s ofertas extraídas", len(out))
+        log.info("Chiletrabajos: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -688,109 +729,68 @@ def parse_chiletrabajos() -> List[Oferta]:
         log.exception("Chiletrabajos error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
 def parse_bne() -> List[Oferta]:
-    """Parser mejorado para BNE (Bolsa Nacional de Empleo)"""
+    """BNE - Optimizado con variación de URLs"""
     source = "BNE"
     if should_cooldown(source):
-        log.info("%s en cooldown", source)
         return []
     
     out: List[Oferta] = []
     base = "https://www.bne.cl"
     
-    # Múltiples URLs para maximizar cobertura
+    # Probar múltiples variantes
     urls = [
-        f"{base}/ofertas?textoBusqueda=&ubicacion=Osorno",
-        f"{base}/ofertas?textoBusqueda=&comuna=Osorno",
-        f"{base}/ofertas?textoBusqueda=&region=LosLagos",
-        f"{base}/ofertas?textoBusqueda=&ciudad=Osorno",
+        # Variante 1: ubicacion
+        f"{base}/ofertas?ubicacion=Osorno",
+        f"{base}/ofertas?ubicacion=Osorno&pagina=2",
+        # Variante 2: comuna  
+        f"{base}/ofertas?comuna=Osorno",
+        # Variante 3: región
+        f"{base}/ofertas?region=Los Lagos",
     ]
     
     try:
-        seen_links: Set[str] = set()
+        seen: Set[str] = set()
         
         for u in urls:
-            log.debug("BNE: scraping %s", u)
-            soup = get_soup(u, retries=3)
+            log.debug("BNE: %s", u)
+            soup = get_soup(u, retries=2)
             if not soup:
                 continue
             
-            # Estrategia 1: Enlaces directos a ofertas
+            # Estrategia 1: Links con keywords
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
-                text = limpiar(a.get_text(" "))
+                text = limpiar(a.get_text())
                 
-                if len(text) < 6:
+                if len(text) < 8:
                     continue
                 
                 href_low = href.lower()
                 
-                # BNE usa patrones /ofertas/<id> o /trabajo/<id>
-                if not any(tok in href_low for tok in ["/ofertas/", "/oferta/", "/trabajo/", "/empleo/"]):
+                # Debe ser link de oferta
+                if not any(tok in href_low for tok in ["/oferta", "/empleo", "/trabajo", "/vacante"]):
                     continue
                 
-                # Filtrar navegación y paginación
-                if any(tok in href_low for tok in ["page=", "filtro", "categoria", "buscar"]):
-                    continue
-                
-                # Resolver URL
-                if href.startswith("http"):
-                    link = href
-                elif href.startswith("/"):
-                    link = f"{base}{href}"
-                else:
-                    continue
-                
-                if link in seen_links:
-                    continue
-                seen_links.add(link)
-                
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
-            
-            # Estrategia 2: Cards de ofertas con selectores específicos
-            for card in soup.select("[class*='card']," +  "[class*='oferta'], [class*='job']"):
-                a = card.find("a", href=True)
-                if not a:
-                    continue
-                
-                href = a.get("href", "")
-                if not href:
-                    continue
-                
-                # Buscar título en el card
-                title_el = card.find(["h2", "h3", "h4", "h5"]) or a
-                title = limpiar(title_el.get_text(" "))
-                
-                if len(title) < 6:
+                # No navegación
+                if any(tok in href_low for tok in ["filtro", "buscar", "categoria", "page="]):
                     continue
                 
                 link = href if href.startswith("http") else urljoin(base, href)
                 
-                if link in seen_links:
+                if link in seen:
                     continue
-                seen_links.add(link)
+                seen.add(link)
                 
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=title,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+            
+            time.sleep(0.2)
         
-        log.info("BNE: %s ofertas extraídas", len(out))
+        log.info("BNE: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -798,39 +798,35 @@ def parse_bne() -> List[Oferta]:
         log.exception("BNE error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
 def parse_indeed_rss() -> List[Oferta]:
-    """Parser para Indeed vía RSS"""
+    """Indeed RSS Feed - Osorno específico"""
     source = "Indeed"
     if should_cooldown(source):
-        log.info("%s en cooldown", source)
         return []
     
     out: List[Oferta] = []
     try:
+        # Feed RSS con parámetros optimizados
         q = quote_plus("osorno")
         l_param = quote_plus("Osorno, Los Lagos")
         feed_url = f"https://cl.indeed.com/rss?q={q}&l={l_param}&sort=date&limit=50"
         
-        log.debug("Indeed RSS: fetching %s", feed_url)
+        log.debug("Indeed RSS: %s", feed_url)
         feed = feedparser.parse(feed_url)
-        
-        if not feed.entries:
-            log.warning("Indeed RSS: sin entradas en el feed")
         
         for e in feed.entries:
             title = limpiar(html.unescape(getattr(e, "title", "")))
             link = getattr(e, "link", "")
-            summary = limpiar(
-                BeautifulSoup(getattr(e, "summary", ""), "html.parser").get_text(" ")
-            )
+            summary = limpiar(BeautifulSoup(getattr(e, "summary", ""), "html.parser").get_text())
             
             if not title or not link:
                 continue
             
+            # Parsear título compuesto: "Titulo - Empresa"
             company = "No especificada"
             if " - " in title:
                 parts = title.split(" - ", 1)
@@ -848,7 +844,7 @@ def parse_indeed_rss() -> List[Oferta]:
                 )
             )
         
-        log.info("Indeed: %s ofertas extraídas", len(out))
+        log.info("Indeed: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -856,103 +852,66 @@ def parse_indeed_rss() -> List[Oferta]:
         log.exception("Indeed error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
 def parse_computrabajo() -> List[Oferta]:
-    """Parser especializado para Computrabajo"""
+    """Computrabajo - Filtro estricto por patrón de URL"""
     source = "Computrabajo"
     if should_cooldown(source):
-        log.info("%s en cooldown", source)
         return []
     
     BASE = "https://cl.computrabajo.com"
-    # Regex más permisivo para IDs de Computrabajo
-    RE_LISTING = re.compile(r"-[0-9a-f]{6,}\.html?$", re.I)
+    
+    # Patrón de listing: -HASH.html al final
+    RE_LISTING = re.compile(r'-[0-9a-f]{6,}\.html?$', re.I)
     
     urls = [
         f"{BASE}/empleos-en-los-lagos-en-osorno",
         f"{BASE}/empleos-en-los-lagos-en-osorno?p=2",
         f"{BASE}/empleos-en-los-lagos-en-osorno?p=3",
+        f"{BASE}/ofertas-de-trabajo/en-osorno",
     ]
     
     out: List[Oferta] = []
     try:
-        seen_links: Set[str] = set()
+        seen: Set[str] = set()
         
         for u in urls:
-            log.debug("Computrabajo: scraping %s", u)
-            soup = get_soup(u, retries=3)
+            log.debug("Computrabajo: %s", u)
+            soup = get_soup(u, retries=2)
             if not soup:
                 continue
             
-            # Estrategia 1: Enlaces que coincidan con el patrón de listing
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
                 if not href:
                     continue
                 
-                href_low = href.lower()
-                
-                # Debe contener "oferta" y terminar con hash.html
-                if "oferta" not in href_low:
-                    continue
-                if not RE_LISTING.search(href_low):
+                # DEBE tener el patrón de hash
+                if not RE_LISTING.search(href.lower()):
                     continue
                 
-                text = limpiar(a.get_text(" "))
-                if len(text) < 6:
+                # DEBE contener "oferta"
+                if "oferta" not in href.lower():
+                    continue
+                
+                text = limpiar(a.get_text())
+                if len(text) < 8:
                     continue
                 
                 link = href if href.startswith("http") else f"{BASE}{href}"
                 
-                if link in seen_links:
+                if link in seen:
                     continue
-                seen_links.add(link)
+                seen.add(link)
                 
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
             
-            # Estrategia 2: Divs/articles de ofertas
-            for card in soup.select("[class*='box-'], [class*='offer'], article"):
-                a = card.find("a", href=True)
-                if not a:
-                    continue
-                
-                href = a.get("href", "")
-                if not href or not RE_LISTING.search(href.lower()):
-                    continue
-                
-                # Buscar título
-                title_el = card.find(["h2", "h3", "h4"]) or a
-                title = limpiar(title_el.get_text(" "))
-                
-                if len(title) < 6:
-                    continue
-                
-                link = href if href.startswith("http") else f"{BASE}{href}"
-                
-                if link in seen_links:
-                    continue
-                seen_links.add(link)
-                
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=title,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+            time.sleep(0.2)
         
-        log.info("Computrabajo: %s ofertas extraídas", len(out))
+        log.info("Computrabajo: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -960,44 +919,30 @@ def parse_computrabajo() -> List[Oferta]:
         log.exception("Computrabajo error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
 def parse_yapo() -> List[Oferta]:
-    """Parser especializado para Yapo empleos"""
+    """Yapo - Filtros estrictos para empleo"""
     source = "Yapo"
     if should_cooldown(source):
-        log.info("%s en cooldown", source)
         return []
     
     BASE = "https://www.yapo.cl"
     
-    JOB_CATEGORY_SLUGS = (
-        "/empleos/",
-        "/trabajo/",
-        "/oferta-laboral/",
-        "/empleo/",
-    )
-    RE_LISTING_ID = re.compile(r"\d{5,}\.html?$")
+    # Categorías de empleo
+    JOB_SLUGS = ("/empleos/", "/trabajo/", "/empleo/", "/oferta-laboral/")
     
+    # Categorías a rechazar
     REJECT_SLUGS = (
-        "/arriendo", "/venta", "/compra",
-        "/autos", "/motos", "/vehiculo",
-        "/servicios", "/servicio",
-        "/inmueble", "/propiedad",
-        "/electronico", "/computacion",
-        "/moda", "/ropa", "/deporte",
-        "/mascota", "/animal", "/hogar",
-        "/mueble", "/regalo",
+        "/arriendo", "/venta", "/compra", "/autos", "/motos",
+        "/servicios", "/inmueble", "/electronico", "/moda",
+        "/deporte", "/mascota", "/hogar", "/mueble"
     )
     
-    REJECT_TITLE_PATTERNS = re.compile(
-        r"^(ver m[aá]s|publicar|iniciar|registrar|subir|buscar|"
-        r"filtrar|ordenar|anterior|siguiente|p[aá]gina|volver|"
-        r"inicio|cuenta|ayuda|contacto|\d+\s*result).*$",
-        re.I,
-    )
+    # Pattern de ID numérico
+    RE_ID = re.compile(r'\d{5,}\.html?$')
     
     urls = [
         f"{BASE}/empleos?ca=12_s&l=0&q=osorno",
@@ -1007,15 +952,14 @@ def parse_yapo() -> List[Oferta]:
     
     out: List[Oferta] = []
     try:
-        seen_links: Set[str] = set()
+        seen: Set[str] = set()
         
         for u in urls:
-            log.debug("Yapo: scraping %s", u)
-            soup = get_soup(u, retries=3)
+            log.debug("Yapo: %s", u)
+            soup = get_soup(u, retries=2)
             if not soup:
                 continue
             
-            # Estrategia 1: Enlaces directos
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
                 if not href:
@@ -1023,73 +967,37 @@ def parse_yapo() -> List[Oferta]:
                 
                 href_low = href.lower()
                 
-                # Validar patrón de listing
-                if not RE_LISTING_ID.search(href_low):
+                # Debe terminar con ID.html
+                if not RE_ID.search(href_low):
                     continue
-                if not any(slug in href_low for slug in JOB_CATEGORY_SLUGS):
+                
+                # Debe ser categoría de empleo
+                if not any(slug in href_low for slug in JOB_SLUGS):
                     continue
+                
+                # NO debe ser otra categoría
                 if any(slug in href_low for slug in REJECT_SLUGS):
                     continue
                 
-                text = limpiar(a.get_text(" "))
-                if len(text) < 6:
+                text = limpiar(a.get_text())
+                if len(text) < 8:
                     continue
-                if REJECT_TITLE_PATTERNS.match(text):
+                
+                # Filtrar navegación
+                if re.match(r'^(ver|filtrar|buscar|ordenar|página)', text, re.I):
                     continue
                 
                 link = href if href.startswith("http") else urljoin(BASE, href)
                 
-                if link in seen_links:
+                if link in seen:
                     continue
-                seen_links.add(link)
+                seen.add(link)
                 
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
             
-            # Estrategia 2: Listings con clase
-            for listing in soup.select("[class*='listing'], [class*='aviso'], li.ad"):
-                a = listing.find("a", href=True)
-                if not a:
-                    continue
-                
-                href = a.get("href", "")
-                if not href:
-                    continue
-                
-                href_low = href.lower()
-                if not RE_LISTING_ID.search(href_low):
-                    continue
-                if not any(slug in href_low for slug in JOB_CATEGORY_SLUGS):
-                    continue
-                
-                title_el = listing.find(["h2", "h3", "h4"]) or a
-                title = limpiar(title_el.get_text(" "))
-                
-                if len(title) < 6 or REJECT_TITLE_PATTERNS.match(title):
-                    continue
-                
-                link = href if href.startswith("http") else urljoin(BASE, href)
-                
-                if link in seen_links:
-                    continue
-                seen_links.add(link)
-                
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=title,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+            time.sleep(0.2)
         
-        log.info("Yapo: %s ofertas extraídas", len(out))
+        log.info("Yapo: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -1097,15 +1005,14 @@ def parse_yapo() -> List[Oferta]:
         log.exception("Yapo error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
 def parse_trabajando() -> List[Oferta]:
-    """Parser para Trabajando.com"""
+    """Trabajando.com - Osorno"""
     source = "Trabajando"
     if should_cooldown(source):
-        log.info("%s en cooldown", source)
         return []
     
     BASE = "https://www.trabajando.cl"
@@ -1117,47 +1024,42 @@ def parse_trabajando() -> List[Oferta]:
     
     out: List[Oferta] = []
     try:
-        seen_links: Set[str] = set()
+        seen: Set[str] = set()
         
         for u in urls:
-            log.debug("Trabajando: scraping %s", u)
-            soup = get_soup(u, retries=3)
+            log.debug("Trabajando: %s", u)
+            soup = get_soup(u, retries=2)
             if not soup:
                 continue
             
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
-                text = limpiar(a.get_text(" "))
+                text = limpiar(a.get_text())
                 
-                if len(text) < 6:
+                if len(text) < 8:
                     continue
                 
                 href_low = href.lower()
                 
-                # Trabajando usa /empleo/<id> o /ofertas/<id>
+                # Debe contener empleo/oferta/trabajo
                 if not any(tok in href_low for tok in ["/empleo/", "/oferta/", "/trabajo/", "/vacante/"]):
                     continue
                 
-                # Filtrar navegación
-                if any(tok in href_low for tok in ["filtro", "categoria", "buscar", "page"]):
+                # No navegación
+                if any(tok in href_low for tok in ["filtro", "categoria", "buscar", "pagina"]):
                     continue
                 
                 link = href if href.startswith("http") else urljoin(BASE, href)
                 
-                if link in seen_links:
+                if link in seen:
                     continue
-                seen_links.add(link)
+                seen.add(link)
                 
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+            
+            time.sleep(0.2)
         
-        log.info("Trabajando: %s ofertas extraídas", len(out))
+        log.info("Trabajando: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -1165,15 +1067,14 @@ def parse_trabajando() -> List[Oferta]:
         log.exception("Trabajando error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
 def parse_acciontrabajo() -> List[Oferta]:
-    """Parser para Acciontrabajo.com"""
+    """Acciontrabajo.com - Osorno"""
     source = "Acciontrabajo"
     if should_cooldown(source):
-        log.info("%s en cooldown", source)
         return []
     
     BASE = "https://cl.acciontrabajo.com"
@@ -1185,47 +1086,42 @@ def parse_acciontrabajo() -> List[Oferta]:
     
     out: List[Oferta] = []
     try:
-        seen_links: Set[str] = set()
+        seen: Set[str] = set()
         
         for u in urls:
-            log.debug("Acciontrabajo: scraping %s", u)
-            soup = get_soup(u, retries=3)
+            log.debug("Acciontrabajo: %s", u)
+            soup = get_soup(u, retries=2)
             if not soup:
                 continue
             
             for a in soup.select("a[href]"):
                 href = a.get("href", "")
-                text = limpiar(a.get_text(" "))
+                text = limpiar(a.get_text())
                 
-                if len(text) < 6:
+                if len(text) < 8:
                     continue
                 
                 href_low = href.lower()
                 
-                # Acciontrabajo usa /trabajo/<id> o /empleo/<id>
+                # Debe contener trabajo/empleo/oferta
                 if not any(tok in href_low for tok in ["/trabajo/", "/empleo/", "/oferta/"]):
                     continue
                 
-                # Filtrar navegación
-                if any(tok in href_low for tok in ["/buscar", "/filtro", "/categoria", "/region", "page"]):
+                # No navegación
+                if any(tok in href_low for tok in ["/buscar", "/filtro", "/region", "page"]):
                     continue
                 
                 link = href if href.startswith("http") else urljoin(BASE, href)
                 
-                if link in seen_links:
+                if link in seen:
                     continue
-                seen_links.add(link)
+                seen.add(link)
                 
-                out.append(
-                    Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True,
-                    )
-                )
+                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+            
+            time.sleep(0.2)
         
-        log.info("Acciontrabajo: %s ofertas extraídas", len(out))
+        log.info("Acciontrabajo: %s ofertas", len(out))
         set_source_ok(source)
         return dedup(out)
     
@@ -1233,7 +1129,7 @@ def parse_acciontrabajo() -> List[Oferta]:
         log.exception("Acciontrabajo error: %s", e)
         c = set_source_error(source, str(e))
         if c in (1, 3, 5):
-            enviar(f"⚠️ {source} con errores consecutivos: {c}\n{str(e)[:180]}")
+            enviar(f"⚠️ {source} error: {str(e)[:180]}")
         return []
 
 
@@ -1255,7 +1151,6 @@ def dedup(items: List[Oferta]) -> List[Oferta]:
 
 
 def upsert_job(o: Oferta) -> Tuple[int, str, str]:
-    """Inserta o actualiza un trabajo en la base de datos"""
     fingerprint = short_hash(o.link)
     job_code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
     
@@ -1420,7 +1315,7 @@ def process_telegram_commands() -> None:
     try:
         data = telegram_api("getUpdates", {"timeout": 1, "offset": offset + 1})
     except Exception as e:
-        log.warning("Error procesando comandos Telegram: %s", e)
+        log.warning("Error procesando comandos: %s", e)
         return
     
     for upd in data.get("result", []):
@@ -1457,7 +1352,7 @@ def process_telegram_commands() -> None:
 
 
 def run_cycle() -> Dict[str, object]:
-    """Ejecuta un ciclo completo de scraping"""
+    """Ejecuta un ciclo de scraping"""
     sources = [
         parse_chiletrabajos,
         parse_bne,
@@ -1487,15 +1382,12 @@ def run_cycle() -> Dict[str, object]:
     digest_bucket: List[Tuple[Oferta, str]] = []
     
     for o in dedup(found):
-        # Enriquecer oferta
         o = enriquecer_oferta(o)
         
-        # Aplicar filtros
         if not pasa_filtros(o):
-            log.debug("Oferta filtrada: %s - %s", o.source, o.title)
+            log.debug("Filtrada: %s - %s", o.source, o.title)
             continue
         
-        # Insertar en DB
         job_id, applied_status, op = upsert_job(o)
         
         if op != "inserted":
@@ -1504,7 +1396,6 @@ def run_cycle() -> Dict[str, object]:
         
         code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
         
-        # Decidir si enviar inmediatamente o al digest
         if score_oferta(o) >= MIN_SCORE_IMMEDIATE:
             msg = formatear_oferta(o, code, applied_status)
             message_id = enviar(msg)
@@ -1514,16 +1405,14 @@ def run_cycle() -> Dict[str, object]:
         
         new_count += 1
     
-    # Incrementar contador de ciclos
     cycle_num = get_state_int("cycle_counter", 0) + 1
     set_state_str("cycle_counter", str(cycle_num))
     
-    # Enviar digest si corresponde
     if digest_bucket and cycle_num % max(1, DIGEST_EVERY_CYCLES) == 0:
         enviar(formatear_digest(digest_bucket))
     
     log.info(
-        "Ciclo completo | fuentes=%s | encontradas=%s | nuevas=%s | ya_registradas=%s",
+        "Ciclo OK | fuentes=%s | encontradas=%s | nuevas=%s | ya_registradas=%s",
         per_source,
         len(found),
         new_count,
@@ -1562,19 +1451,18 @@ def enviar_reporte_diario_si_corresponde() -> None:
 
 def main() -> None:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not DATABASE_URL:
-        raise RuntimeError("Config incompleta. Requiere TELEGRAM_TOKEN, TELEGRAM_CHAT_ID y DATABASE_URL")
+        raise RuntimeError("Config incompleta")
     
     init_db()
     enviar(
-        "🚀 BOT EMPLEOS OSORNO ACTIVO (VERSIÓN MEJORADA)\n"
+        "🚀 BOT EMPLEOS OSORNO - OPTIMIZADO\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "🌐 Fuentes: Chiletrabajos | BNE | Indeed | Computrabajo | Yapo | Trabajando | Acciontrabajo\n"
+        "🌐 Fuentes activas: 7\n"
         f"⏱️ Intervalo: {INTERVALO}s\n"
-        f"🧠 Detail enrichment: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
-        f"⭐ Min score alerta inmediata: {MIN_SCORE_IMMEDIATE}\n"
-        "🛠️ Comandos: /postule | /nopostule | /estado | /stats | /ultimas\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        "✨ Parsers especializados por fuente con mejor extracción"
+        f"🧠 Enriquecimiento: {'ON' if ENABLE_DETAIL_ENRICHMENT else 'OFF'}\n"
+        "✨ Descripciones limpias\n"
+        "🔧 Parsers optimizados\n"
+        "━━━━━━━━━━━━━━━━━━━━"
     )
     
     while True:
@@ -1596,15 +1484,14 @@ def main() -> None:
                 )
             
             elapsed = time.time() - start
-            log.info("Ciclo OK | nuevos=%s | %.1fs", int(cycle_stats["new_count"]), elapsed)
+            log.info("Ciclo completo en %.1fs", elapsed)
         
         except Exception as e:
             log.exception("Error en ciclo: %s", e)
-            enviar(f"❌ Error ciclo: {str(e)[:200]}")
+            enviar(f"❌ Error: {str(e)[:200]}")
             elapsed = time.time() - start
         
         sleep_time = max(10, INTERVALO - int(elapsed))
-        log.debug("Esperando %ss hasta próximo ciclo", sleep_time)
         time.sleep(sleep_time)
 
 
