@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Bot Osorno v5 - ULTRA-ROBUSTO
-- Múltiples estrategias de extracción por fuente
-- Parsers resilientes que NO fallan
-- Logging detallado para debugging
-- Testing integrado por fuente
-- SIN filtros estrictos
+Bot Osorno v6 DEFINITIVO
+- 5-7 estrategias de extracción por fuente
+- Sistema anti-fallas total con fallbacks
+- Formato Telegram profesional
+- Logging ultra-detallado
+- Schema DB compatible
 """
 
 import json
@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 # Configuración
 INTERVALO = int(os.getenv("INTERVALO", "90"))
 MAX_MSG = 4096
-LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()  # DEBUG por defecto
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "0"))
 HEARTBEAT_EVERY_CYCLES = int(os.getenv("HEARTBEAT_EVERY_CYCLES", "10"))
 
@@ -49,7 +49,7 @@ OSORNO_SIGNALS = ["osorno", "los lagos", "región de los lagos", "region de los 
 KEYWORDS_EXCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_EXCLUDE", "").split(",") if k.strip()]
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 log = logging.getLogger("bot")
@@ -94,8 +94,6 @@ def extraer_requisitos(descripcion: str) -> List[Requisito]:
                 linea = limpiar(linea)
                 if len(linea) < 15 or len(linea) > 200:
                     continue
-                if any(noise in linea.lower() for noise in ['publicidad', 'postular']):
-                    continue
                 
                 tipo = "general"
                 if any(x in linea.lower() for x in ['título', 'estudios', 'técnic', 'media']):
@@ -126,8 +124,6 @@ def generar_resumen(descripcion: str, max_words: int = 50) -> str:
         oracion = limpiar(oracion)
         if len(oracion) < 30:
             continue
-        if any(x in oracion.lower() for x in ['fecha:', 'id:']):
-            continue
         significativas.append(oracion)
         if len(significativas) >= 2:
             break
@@ -148,23 +144,17 @@ def contiene_osorno(txt: str) -> bool:
     return any(sig in txt.lower() for sig in OSORNO_SIGNALS)
 
 def pasa_filtros(o: Oferta) -> bool:
-    """Filtros MUY PERMISIVOS - solo excluir lo explícito"""
     txt = f"{o.title} {o.company} {o.description} {o.link}".lower()
     
-    # Si está verificado, solo excluir keywords explícitas
     if o.location_verified:
         if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
-            log.debug(f"❌ Rechazado por EXCLUDE: {o.title}")
             return False
         return True
     
-    # Si no está verificado, debe contener osorno
     if not contiene_osorno(txt):
-        log.debug(f"❌ Rechazado por ubicación: {o.title}")
         return False
     
     if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
-        log.debug(f"❌ Rechazado por EXCLUDE: {o.title}")
         return False
     
     return True
@@ -186,8 +176,8 @@ def init_db() -> None:
                 salary TEXT,
                 jornada TEXT,
                 description TEXT,
-                requisitos JSONB,
-                resumen TEXT,
+                requisitos JSONB DEFAULT '[]'::jsonb,
+                resumen TEXT DEFAULT 'No disponible',
                 fingerprint TEXT NOT NULL,
                 first_seen_at TIMESTAMPTZ DEFAULT NOW(),
                 last_seen_at TIMESTAMPTZ DEFAULT NOW(),
@@ -205,7 +195,6 @@ def init_db() -> None:
         conn.commit()
 
 def get_soup(url: str, retries: int = 3) -> Optional[BeautifulSoup]:
-    """GET con anti-detección y logging detallado"""
     for i in range(retries):
         try:
             headers = {
@@ -229,21 +218,21 @@ def get_soup(url: str, retries: int = 3) -> Optional[BeautifulSoup]:
             r = session.get(url, timeout=(15, 30), allow_redirects=True)
             r.raise_for_status()
             
-            log.debug(f"✅ GET {url} → {r.status_code} ({len(r.text)} bytes)")
+            log.debug(f"✅ GET {url[:80]}... → {r.status_code} ({len(r.text)} bytes)")
             
             if len(r.text) < 500:
-                log.warning(f"⚠️ Respuesta muy corta: {len(r.text)} bytes para {url}")
+                log.warning(f"⚠️ Respuesta corta: {len(r.text)} bytes")
                 if i < retries - 1:
                     continue
             
             return BeautifulSoup(r.text, "html.parser")
             
         except Exception as e:
-            log.warning(f"❌ GET {url} intento {i+1}/{retries}: {e}")
+            log.warning(f"❌ Intento {i+1}/{retries}: {e}")
             if i < retries - 1:
                 time.sleep(random.uniform(2, 4))
     
-    log.error(f"🚫 FALLÓ COMPLETAMENTE: {url}")
+    log.error(f"🚫 FALLÓ: {url[:80]}...")
     return None
 
 def telegram_send(msg: str) -> Optional[int]:
@@ -264,32 +253,32 @@ def telegram_send(msg: str) -> Optional[int]:
 def formatear_oferta(o: Oferta, code: str, status: str) -> str:
     estado_emoji = {"applied": "✅", "not_applied": "❌", "unknown": "❓"}[status]
     
-    msg = f"""🆕 <b>NUEVA OFERTA</b>
+    # Header más compacto y profesional
+    msg = f"""<b>🆕 NUEVA OFERTA - {o.source.upper()}</b>
 ━━━━━━━━━━━━━━━━━━━━
 
-📌 <b>TÍTULO</b>
-{html.escape(o.title)}
+<b>📌 {html.escape(o.title)}</b>
 
-🆔 {code}
-🏢 <b>EMPRESA:</b> {html.escape(o.company)}
-📅 <b>PUBLICADO:</b> {html.escape(o.date_text)}
-💰 <b>SUELDO:</b> {html.escape(o.salary)}
-🕒 <b>JORNADA:</b> {html.escape(o.jornada)}
-📮 <b>ESTADO:</b> {estado_emoji} {status}
-
-━━━━━━━━━━━━━━━━━━━━
-
-💼 <b>RESUMEN</b>
-{html.escape(o.resumen[:300])}"""
+🆔 <code>{code}</code>
+🏢 {html.escape(o.company)}
+💰 {html.escape(o.salary)}
+🕒 {html.escape(o.jornada)}
+📅 {html.escape(o.date_text)}
+📮 {estado_emoji} <i>{status}</i>"""
     
+    # Resumen
+    if o.resumen and o.resumen != "No disponible":
+        msg += f"\n\n<b>💼 RESUMEN</b>\n{html.escape(o.resumen[:250])}"
+    
+    # Requisitos
     if o.requisitos:
-        msg += "\n\n✅ <b>REQUISITOS</b>"
-        for req in o.requisitos[:5]:
-            icon = {"educacion": "🎓", "experiencia": "💼", "habilidad": "⚡", "certificacion": "📜"}.get(req.tipo, "•")
-            msg += f"\n{icon} {html.escape(req.texto[:100])}"
+        msg += "\n\n<b>✅ REQUISITOS</b>"
+        for req in o.requisitos[:4]:
+            icon = {"educacion": "🎓", "experiencia": "💼", "habilidad": "⚡"}.get(req.tipo, "•")
+            msg += f"\n{icon} {html.escape(req.texto[:90])}"
     
-    msg += f"\n\n━━━━━━━━━━━━━━━━━━━━\n🔗 <a href='{o.link}'>Ver oferta completa</a>"
-    msg += f"\n\n/postule {code} | /nopostule {code}"
+    msg += f"\n\n🔗 <a href='{o.link}'>Ver oferta completa</a>"
+    msg += f"\n\n<code>/postule {code}</code> | <code>/nopostule {code}</code>"
     
     return msg[:MAX_MSG]
 
@@ -315,7 +304,6 @@ def set_source_error(source: str, err: str) -> int:
     return count
 
 def should_cooldown(source: str) -> bool:
-    """Cooldown después de 5 errores (más permisivo)"""
     with get_db() as conn, conn.cursor() as cur:
         cur.execute("SELECT consecutive_errors FROM source_health WHERE source=%s", (source,))
         row = cur.fetchone()
@@ -326,122 +314,157 @@ def should_cooldown(source: str) -> bool:
 
 # ==================== PARSERS ULTRA-ROBUSTOS ====================
 
-def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
+def parse_chiletrabajos() -> Tuple[List[Oferta], Dict]:
     """
-    Parser Chiletrabajos - MÚLTIPLES ESTRATEGIAS
-    Estrategia 1: H2 > A con /trabajo/
-    Estrategia 2: Cualquier A con /trabajo/
-    Estrategia 3: Div con clase de oferta
+    7 ESTRATEGIAS DE EXTRACCIÓN:
+    1. H2 > A con /trabajo/
+    2. H3 > A con /trabajo/
+    3. Div[class*=job|oferta] > A
+    4. TODOS los A con /trabajo/
+    5. A con text que parezca título
+    6. Article > A
+    7. Li > A con /trabajo/
     """
     source = "Chiletrabajos"
     if should_cooldown(source):
         return [], {"error": "cooldown"}
     
-    out: List[Oferta] = []
-    stats = {"paginas": 0, "enlaces_encontrados": 0, "estrategia_1": 0, "estrategia_2": 0, "estrategia_3": 0}
+    out = []
+    stats = {"paginas": 0, "estrategias": {f"E{i}": 0 for i in range(1, 8)}, "total_enlaces": 0}
     base = "https://www.chiletrabajos.cl"
     
     try:
         for offset in [0, 30, 60]:
             url = f"{base}/ciudad/osorno.html" + (f"/{offset}" if offset > 0 else "")
-            log.info(f"🌐 [{source}] Scrapeando: {url}")
+            log.info(f"🌐 [{source}] Página {offset//30 + 1}: {url}")
             
             soup = get_soup(url, retries=3)
             if not soup:
-                log.error(f"❌ [{source}] No se pudo obtener soup de {url}")
                 continue
             
             stats["paginas"] += 1
-            job_links_found = []
+            job_links = []
             
-            # ESTRATEGIA 1: H2 > A con /trabajo/
-            log.debug(f"🔍 [{source}] Probando estrategia 1: H2 > A")
+            # ESTRATEGIA 1: H2 > A
             for h2 in soup.find_all("h2"):
                 a = h2.find("a", href=True)
-                if not a:
-                    continue
-                href = a.get("href", "")
-                if "/trabajo/" in href:
+                if a and "/trabajo/" in a.get("href", ""):
+                    href = a.get("href")
                     link = href if href.startswith("http") else f"{base}{href}"
                     title = limpiar(a.get_text())
-                    if len(title) >= 5 and link not in [x[0] for x in job_links_found]:
-                        job_links_found.append((link, title, "No especificada"))
-                        stats["estrategia_1"] += 1
+                    if len(title) >= 5 and link not in [x[0] for x in job_links]:
+                        job_links.append((link, title, "No especificada", "E1"))
+                        stats["estrategias"]["E1"] += 1
             
-            # ESTRATEGIA 2: TODOS los <a> con /trabajo/
-            if len(job_links_found) < 10:
-                log.debug(f"🔍 [{source}] Probando estrategia 2: Todos los <a> con /trabajo/")
+            # ESTRATEGIA 2: H3 > A
+            for h3 in soup.find_all("h3"):
+                a = h3.find("a", href=True)
+                if a and "/trabajo/" in a.get("href", ""):
+                    href = a.get("href")
+                    link = href if href.startswith("http") else f"{base}{href}"
+                    title = limpiar(a.get_text())
+                    if len(title) >= 5 and link not in [x[0] for x in job_links]:
+                        job_links.append((link, title, "No especificada", "E2"))
+                        stats["estrategias"]["E2"] += 1
+            
+            # ESTRATEGIA 3: Divs con clase job/oferta
+            for div in soup.find_all("div", class_=re.compile(r'(job|oferta|trabajo|empleo|card|item)', re.I)):
+                a = div.find("a", href=True)
+                if a and "/trabajo/" in a.get("href", ""):
+                    href = a.get("href")
+                    link = href if href.startswith("http") else f"{base}{href}"
+                    title = limpiar(a.get_text())
+                    if len(title) >= 5 and link not in [x[0] for x in job_links]:
+                        job_links.append((link, title, "No especificada", "E3"))
+                        stats["estrategias"]["E3"] += 1
+            
+            # ESTRATEGIA 4: TODOS los A con /trabajo/
+            if len(job_links) < 15:
                 for a in soup.find_all("a", href=True):
                     href = a.get("href", "")
                     if "/trabajo/" in href:
                         link = href if href.startswith("http") else f"{base}{href}"
                         title = limpiar(a.get_text())
-                        if len(title) >= 5 and link not in [x[0] for x in job_links_found]:
-                            job_links_found.append((link, title, "No especificada"))
-                            stats["estrategia_2"] += 1
+                        if len(title) >= 5 and link not in [x[0] for x in job_links]:
+                            job_links.append((link, title, "No especificada", "E4"))
+                            stats["estrategias"]["E4"] += 1
             
-            # ESTRATEGIA 3: Divs con clases comunes de ofertas
-            if len(job_links_found) < 5:
-                log.debug(f"🔍 [{source}] Probando estrategia 3: Divs con clase oferta")
-                for div in soup.find_all("div", class_=re.compile(r'(job|oferta|trabajo|card|item)', re.I)):
-                    a = div.find("a", href=True)
-                    if a and "/trabajo/" in a.get("href", ""):
+            # ESTRATEGIA 5: A con texto que parezca título de trabajo
+            if len(job_links) < 10:
+                for a in soup.find_all("a", href=True):
+                    text = limpiar(a.get_text())
+                    if 10 < len(text) < 100 and any(kw in text.lower() for kw in ["vendedor", "asistente", "técnico", "ejecutivo", "analista", "operador", "supervisor"]):
                         href = a.get("href", "")
+                        if "/trabajo/" in href or "empleo" in href.lower():
+                            link = href if href.startswith("http") else f"{base}{href}"
+                            if link not in [x[0] for x in job_links]:
+                                job_links.append((link, text, "No especificada", "E5"))
+                                stats["estrategias"]["E5"] += 1
+            
+            # ESTRATEGIA 6: Article > A
+            if len(job_links) < 5:
+                for article in soup.find_all("article"):
+                    a = article.find("a", href=True)
+                    if a:
+                        href = a.get("href", "")
+                        if "/trabajo/" in href:
+                            link = href if href.startswith("http") else f"{base}{href}"
+                            title = limpiar(a.get_text())
+                            if len(title) >= 5 and link not in [x[0] for x in job_links]:
+                                job_links.append((link, title, "No especificada", "E6"))
+                                stats["estrategias"]["E6"] += 1
+            
+            # ESTRATEGIA 7: Li > A
+            if len(job_links) < 5:
+                for li in soup.find_all("li"):
+                    a = li.find("a", href=True)
+                    if a and "/trabajo/" in a.get("href", ""):
+                        href = a.get("href")
                         link = href if href.startswith("http") else f"{base}{href}"
                         title = limpiar(a.get_text())
-                        if len(title) >= 5 and link not in [x[0] for x in job_links_found]:
-                            job_links_found.append((link, title, "No especificada"))
-                            stats["estrategia_3"] += 1
+                        if len(title) >= 5 and link not in [x[0] for x in job_links]:
+                            job_links.append((link, title, "No especificada", "E7"))
+                            stats["estrategias"]["E7"] += 1
             
-            stats["enlaces_encontrados"] += len(job_links_found)
-            log.info(f"📊 [{source}] Página {stats['paginas']}: {len(job_links_found)} enlaces (E1:{stats['estrategia_1']} E2:{stats['estrategia_2']} E3:{stats['estrategia_3']})")
+            stats["total_enlaces"] += len(job_links)
+            log.info(f"📊 Encontrados: {len(job_links)} enlaces - {dict([(k, v) for k, v in stats['estrategias'].items() if v > 0])}")
             
             # Procesar ofertas
-            for link, title, empresa in job_links_found[:30]:  # Limitar a 30 por página
+            for link, title, empresa, estrategia in job_links[:30]:
                 try:
                     det_soup = get_soup(link, retries=2)
-                    if not det_soup:
-                        # Si falla detalles, guardar con info básica
-                        out.append(Oferta(
-                            source=source,
-                            title=title,
-                            link=link,
-                            company=empresa,
-                            location_verified=True
-                        ))
-                        continue
-                    
-                    # Extraer detalles
+                    descripcion = "No disponible"
                     fecha = "No especificada"
                     sueldo = "No especificado"
                     jornada = "No especificada"
                     
-                    for td in det_soup.select("table td"):
-                        txt = limpiar(td.get_text()).lower()
-                        sib = td.find_next_sibling("td")
-                        if not sib:
-                            continue
+                    if det_soup:
+                        # Extraer detalles de tabla
+                        for td in det_soup.select("table td"):
+                            txt = limpiar(td.get_text()).lower()
+                            sib = td.find_next_sibling("td")
+                            if not sib:
+                                continue
+                            val = limpiar(sib.get_text())
+                            if "fecha" in txt and "expira" not in txt:
+                                fecha = val
+                            elif "salario" in txt or "sueldo" in txt:
+                                if val and val.lower() not in ["no especificado", "a convenir"]:
+                                    sueldo = val if val.startswith("$") else f"${val}"
+                            elif "tipo" in txt or "jornada" in txt:
+                                jornada = val
                         
-                        val = limpiar(sib.get_text())
-                        if "fecha" in txt and "expira" not in txt:
-                            fecha = val
-                        elif "salario" in txt or "sueldo" in txt:
-                            if val and val.lower() not in ["no especificado", "a convenir"]:
-                                sueldo = val if val.startswith("$") else f"${val}"
-                        elif "tipo" in txt or "jornada" in txt:
-                            jornada = val
+                        # Descripción
+                        desc_parts = []
+                        for tag in det_soup.find_all(["p", "div", "li"]):
+                            txt = limpiar(tag.get_text())
+                            if 30 < len(txt) < 1000:
+                                if not any(noise in txt for noise in ["PUBLICIDAD", "Volver"]):
+                                    desc_parts.append(txt)
+                                    if len(desc_parts) >= 5:
+                                        break
+                        descripcion = " ".join(desc_parts) if desc_parts else "No disponible"
                     
-                    # Descripción
-                    desc_parts = []
-                    for tag in det_soup.find_all(["p", "div", "li"]):
-                        txt = limpiar(tag.get_text())
-                        if 30 < len(txt) < 1000:
-                            if not any(noise in txt for noise in ["PUBLICIDAD", "Volver", "Buscar"]):
-                                desc_parts.append(txt)
-                                if len(desc_parts) >= 5:
-                                    break
-                    
-                    descripcion = " ".join(desc_parts) if desc_parts else "No disponible"
                     requisitos = extraer_requisitos(descripcion)
                     resumen = generar_resumen(descripcion)
                     
@@ -462,7 +485,7 @@ def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
                     time.sleep(random.uniform(0.3, 0.7))
                     
                 except Exception as e:
-                    log.warning(f"⚠️ [{source}] Error procesando {link}: {e}")
+                    log.warning(f"⚠️ Error procesando {link[:60]}...: {e}")
                     # Guardar con info básica
                     out.append(Oferta(
                         source=source,
@@ -474,25 +497,31 @@ def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
             time.sleep(random.uniform(1, 2))
         
         set_source_ok(source)
-        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas")
         
     except Exception as e:
-        log.exception(f"❌ [{source}] ERROR CRÍTICO: {e}")
+        log.exception(f"❌ [{source}] ERROR: {e}")
         set_source_error(source, str(e))
     
     return dedup(out), stats
 
-def parse_bne() -> Tuple[List[Oferta], Dict[str, int]]:
+def parse_bne() -> Tuple[List[Oferta], Dict]:
     """
-    Parser BNE - MÚLTIPLES ESTRATEGIAS
+    6 ESTRATEGIAS:
+    1. a.job-link, a[href*='oferta']
+    2. Divs con clase job/oferta > A
+    3. A con keywords de trabajo en texto
+    4. Article > A
+    5. TODOS los A con "oferta" en href
+    6. Table > A con href relevante
     """
     source = "BNE"
     if should_cooldown(source):
         return [], {"error": "cooldown"}
     
-    out: List[Oferta] = []
-    stats = {"enlaces_encontrados": 0}
-    seen: Set[str] = set()
+    out = []
+    stats = {"estrategias": {f"E{i}": 0 for i in range(1, 7)}, "total_enlaces": 0}
+    seen = set()
     
     try:
         urls = [
@@ -508,61 +537,87 @@ def parse_bne() -> Tuple[List[Oferta], Dict[str, int]]:
             if not soup:
                 continue
             
-            # ESTRATEGIA 1: Selectores CSS específicos
-            for selector in ["a.job-link", "a[href*='oferta']", "a[href*='empleo']", "a[href*='trabajo']"]:
+            # E1: Selectores específicos
+            for selector in ["a.job-link", "a[href*='oferta']", "a[href*='empleo']"]:
                 for a in soup.select(selector):
                     href = a.get("href", "")
-                    if not href:
-                        continue
-                    
                     text = limpiar(a.get_text())
-                    if len(text) < 8:
-                        continue
-                    
-                    link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
-                    
-                    if link in seen:
-                        continue
-                    seen.add(link)
-                    
-                    out.append(Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True
-                    ))
-                    stats["enlaces_encontrados"] += 1
+                    if len(text) >= 8:
+                        link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E1"] += 1
             
-            # ESTRATEGIA 2: Todos los enlaces que parezcan ofertas
+            # E2: Divs con clase
+            for div in soup.find_all("div", class_=re.compile(r'(job|oferta|empleo)', re.I)):
+                a = div.find("a", href=True)
+                if a:
+                    href = a.get("href", "")
+                    text = limpiar(a.get_text())
+                    if len(text) >= 8:
+                        link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E2"] += 1
+            
+            # E3: A con keywords
             for a in soup.find_all("a", href=True):
-                href = a.get("href", "")
                 text = limpiar(a.get_text())
-                
-                # Debe parecer un título de trabajo
-                if len(text) < 10 or len(text) > 100:
-                    continue
-                
-                if not any(kw in text.lower() for kw in ["vendedor", "asistente", "técnico", "ejecutivo", "analista", "operador", "supervisor", "administrativo", "coordinador", "ingeniero"]):
-                    continue
-                
-                link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
-                
-                if link in seen:
-                    continue
-                seen.add(link)
-                
-                out.append(Oferta(
-                    source=source,
-                    title=text,
-                    link=link,
-                    location_verified=True
-                ))
-                stats["enlaces_encontrados"] += 1
+                if 10 < len(text) < 100:
+                    if any(kw in text.lower() for kw in ["vendedor", "asistente", "técnico", "ejecutivo", "analista", "operador", "supervisor", "coordinador", "ingeniero"]):
+                        href = a.get("href", "")
+                        link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                        if link not in seen and ("oferta" in link.lower() or "empleo" in link.lower() or "trabajo" in link.lower()):
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E3"] += 1
+            
+            # E4: Article > A
+            for article in soup.find_all("article"):
+                a = article.find("a", href=True)
+                if a:
+                    text = limpiar(a.get_text())
+                    href = a.get("href", "")
+                    if len(text) >= 8:
+                        link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E4"] += 1
+            
+            # E5: TODOS con "oferta" en href
+            if len(out) < 10:
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if "oferta" in href.lower() or "empleo" in href.lower():
+                        text = limpiar(a.get_text())
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                            if link not in seen:
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E5"] += 1
+            
+            # E6: Table > A
+            if len(out) < 5:
+                for table in soup.find_all("table"):
+                    for a in table.find_all("a", href=True):
+                        text = limpiar(a.get_text())
+                        href = a.get("href", "")
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                            if link not in seen:
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E6"] += 1
             
             time.sleep(random.uniform(1, 2))
         
+        stats["total_enlaces"] = len(out)
         set_source_ok(source)
-        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas - {dict([(k, v) for k, v in stats['estrategias'].items() if v > 0])}")
         
     except Exception as e:
         log.exception(f"❌ [{source}] ERROR: {e}")
@@ -570,24 +625,23 @@ def parse_bne() -> Tuple[List[Oferta], Dict[str, int]]:
     
     return dedup(out), stats
 
-def parse_indeed() -> Tuple[List[Oferta], Dict[str, int]]:
-    """Parser Indeed RSS"""
+def parse_indeed() -> Tuple[List[Oferta], Dict]:
+    """Indeed RSS con fallback a scraping directo"""
     source = "Indeed"
-    stats = {"entradas_rss": 0}
+    stats = {"rss": 0, "scraping": 0}
     
     if should_cooldown(source):
         return [], {"error": "cooldown"}
     
-    out: List[Oferta] = []
+    out = []
     
     try:
+        # Estrategia 1: RSS
         feed_url = f"https://cl.indeed.com/rss?q={quote_plus('osorno')}&l={quote_plus('Osorno, Los Lagos')}&sort=date&limit=50"
-        log.info(f"🌐 [{source}] Scrapeando RSS: {feed_url}")
+        log.info(f"🌐 [{source}] Intentando RSS")
         
         feed = feedparser.parse(feed_url)
-        stats["entradas_rss"] = len(feed.entries)
-        
-        log.info(f"📊 [{source}] RSS retornó {stats['entradas_rss']} entradas")
+        stats["rss"] = len(feed.entries)
         
         for e in feed.entries:
             title = limpiar(html.unescape(getattr(e, "title", "")))
@@ -617,8 +671,24 @@ def parse_indeed() -> Tuple[List[Oferta], Dict[str, int]]:
                 location_verified=True
             ))
         
+        # Estrategia 2: Scraping directo si RSS falla
+        if len(out) == 0:
+            log.info(f"⚠️ [{source}] RSS vacío, intentando scraping directo")
+            direct_url = f"https://cl.indeed.com/jobs?q=osorno&l=Osorno, Los Lagos"
+            soup = get_soup(direct_url, retries=2)
+            
+            if soup:
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if "/rc/clk?" in href or "/viewjob?" in href:
+                        text = limpiar(a.get_text())
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else f"https://cl.indeed.com{href}"
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["scraping"] += 1
+        
         set_source_ok(source)
-        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas (RSS:{stats['rss']} Scraping:{stats['scraping']})")
         
     except Exception as e:
         log.exception(f"❌ [{source}] ERROR: {e}")
@@ -626,15 +696,22 @@ def parse_indeed() -> Tuple[List[Oferta], Dict[str, int]]:
     
     return dedup(out), stats
 
-def parse_computrabajo() -> Tuple[List[Oferta], Dict[str, int]]:
-    """Parser Computrabajo"""
+def parse_computrabajo() -> Tuple[List[Oferta], Dict]:
+    """
+    5 ESTRATEGIAS:
+    1. Article > A
+    2. A con "oferta" en href
+    3. Divs con clase oferta > A
+    4. H2/H3 > A
+    5. TODOS los A con pattern de hash
+    """
     source = "Computrabajo"
     if should_cooldown(source):
         return [], {"error": "cooldown"}
     
-    out: List[Oferta] = []
-    stats = {"enlaces_encontrados": 0}
-    seen: Set[str] = set()
+    out = []
+    stats = {"estrategias": {f"E{i}": 0 for i in range(1, 6)}, "total_enlaces": 0}
+    seen = set()
     base = "https://cl.computrabajo.com"
     
     try:
@@ -650,66 +727,81 @@ def parse_computrabajo() -> Tuple[List[Oferta], Dict[str, int]]:
             if not soup:
                 continue
             
-            # ESTRATEGIA 1: Articles
+            # E1: Article > A
             for article in soup.find_all("article"):
                 a = article.find("a", href=True)
-                if not a:
-                    continue
-                
-                href = a.get("href", "")
-                if "oferta" in href.lower() or re.search(r'-[0-9a-f]{6,}\.html?$', href, re.I):
-                    text = limpiar(a.get_text())
-                    if len(text) < 8:
-                        for h in article.find_all(["h2", "h3"]):
-                            text = limpiar(h.get_text())
-                            if len(text) >= 8:
-                                break
-                    
-                    if len(text) < 8:
-                        continue
-                    
-                    link = href if href.startswith("http") else f"{base}{href}"
-                    
-                    if link in seen:
-                        continue
-                    seen.add(link)
-                    
-                    out.append(Oferta(
-                        source=source,
-                        title=text,
-                        link=link,
-                        location_verified=True
-                    ))
-                    stats["enlaces_encontrados"] += 1
+                if a:
+                    href = a.get("href", "")
+                    if "oferta" in href.lower():
+                        text = limpiar(a.get_text())
+                        if not text or len(text) < 8:
+                            for h in article.find_all(["h2", "h3"]):
+                                text = limpiar(h.get_text())
+                                if len(text) >= 8:
+                                    break
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else f"{base}{href}"
+                            if link not in seen:
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E1"] += 1
             
-            # ESTRATEGIA 2: Todos los links con "oferta"
+            # E2: A con "oferta" en href
             for a in soup.find_all("a", href=True):
                 href = a.get("href", "")
-                if "oferta" not in href.lower():
-                    continue
-                
-                text = limpiar(a.get_text())
-                if len(text) < 8:
-                    continue
-                
-                link = href if href.startswith("http") else f"{base}{href}"
-                
-                if link in seen:
-                    continue
-                seen.add(link)
-                
-                out.append(Oferta(
-                    source=source,
-                    title=text,
-                    link=link,
-                    location_verified=True
-                ))
-                stats["enlaces_encontrados"] += 1
+                if "oferta" in href.lower():
+                    text = limpiar(a.get_text())
+                    if len(text) >= 8:
+                        link = href if href.startswith("http") else f"{base}{href}"
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E2"] += 1
+            
+            # E3: Divs con clase oferta
+            for div in soup.find_all("div", class_=re.compile(r'(oferta|job|empleo)', re.I)):
+                a = div.find("a", href=True)
+                if a:
+                    href = a.get("href", "")
+                    text = limpiar(a.get_text())
+                    if len(text) >= 8:
+                        link = href if href.startswith("http") else f"{base}{href}"
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E3"] += 1
+            
+            # E4: H2/H3 > A
+            for h in soup.find_all(["h2", "h3"]):
+                a = h.find("a", href=True)
+                if a:
+                    href = a.get("href", "")
+                    text = limpiar(a.get_text())
+                    if len(text) >= 8:
+                        link = href if href.startswith("http") else f"{base}{href}"
+                        if link not in seen and ("oferta" in link.lower() or re.search(r'-[0-9a-fA-F]{6,}', link)):
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E4"] += 1
+            
+            # E5: Pattern de hash
+            if len(out) < 10:
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if re.search(r'-[0-9a-fA-F]{6,}\.html?', href):
+                        text = limpiar(a.get_text())
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else f"{base}{href}"
+                            if link not in seen:
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E5"] += 1
             
             time.sleep(random.uniform(1, 2))
         
+        stats["total_enlaces"] = len(out)
         set_source_ok(source)
-        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas - {dict([(k, v) for k, v in stats['estrategias'].items() if v > 0])}")
         
     except Exception as e:
         log.exception(f"❌ [{source}] ERROR: {e}")
@@ -717,15 +809,22 @@ def parse_computrabajo() -> Tuple[List[Oferta], Dict[str, int]]:
     
     return dedup(out), stats
 
-def parse_yapo() -> Tuple[List[Oferta], Dict[str, int]]:
-    """Parser Yapo"""
+def parse_yapo() -> Tuple[List[Oferta], Dict]:
+    """
+    5 ESTRATEGIAS:
+    1. A con \d{5,} en href + /empleo
+    2. Divs con clase ad/aviso > A
+    3. A con keywords en texto
+    4. Article > A
+    5. TODOS los A con número largo en href
+    """
     source = "Yapo"
     if should_cooldown(source):
         return [], {"error": "cooldown"}
     
-    out: List[Oferta] = []
-    stats = {"enlaces_encontrados": 0}
-    seen: Set[str] = set()
+    out = []
+    stats = {"estrategias": {f"E{i}": 0 for i in range(1, 6)}, "total_enlaces": 0}
+    seen = set()
     
     try:
         urls = [
@@ -740,43 +839,76 @@ def parse_yapo() -> Tuple[List[Oferta], Dict[str, int]]:
             if not soup:
                 continue
             
+            # E1: Pattern principal
             for a in soup.find_all("a", href=True):
                 href = a.get("href", "")
-                
-                # Debe tener números (ID)
-                if not re.search(r'\d{5,}', href):
-                    continue
-                
-                # Debe ser empleo/trabajo
-                if not any(x in href.lower() for x in ["/empleo", "/trabajo", "/oferta"]):
-                    continue
-                
-                # Rechazar otras categorías
-                if any(x in href.lower() for x in ["/arriendo", "/venta", "/auto", "/servicio", "/inmueble"]):
-                    continue
-                
+                if re.search(r'\d{5,}', href) and any(x in href.lower() for x in ["/empleo", "/trabajo", "/oferta"]):
+                    if not any(x in href.lower() for x in ["/arriendo", "/venta", "/auto", "/servicio"]):
+                        text = limpiar(a.get_text())
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
+                            if link not in seen:
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E1"] += 1
+            
+            # E2: Divs con clase ad/aviso
+            for div in soup.find_all("div", class_=re.compile(r'(ad|aviso|listing|item)', re.I)):
+                a = div.find("a", href=True)
+                if a:
+                    href = a.get("href", "")
+                    text = limpiar(a.get_text())
+                    if len(text) >= 8 and re.search(r'\d{5,}', href):
+                        link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E2"] += 1
+            
+            # E3: Keywords
+            for a in soup.find_all("a", href=True):
                 text = limpiar(a.get_text())
-                if len(text) < 8:
-                    continue
-                
-                link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
-                
-                if link in seen:
-                    continue
-                seen.add(link)
-                
-                out.append(Oferta(
-                    source=source,
-                    title=text,
-                    link=link,
-                    location_verified=True
-                ))
-                stats["enlaces_encontrados"] += 1
+                if 10 < len(text) < 100:
+                    if any(kw in text.lower() for kw in ["vendedor", "asistente", "técnico", "ejecutivo", "se busca", "se solicita"]):
+                        href = a.get("href", "")
+                        if re.search(r'\d{5,}', href):
+                            link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
+                            if link not in seen:
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E3"] += 1
+            
+            # E4: Article
+            for article in soup.find_all("article"):
+                a = article.find("a", href=True)
+                if a:
+                    href = a.get("href", "")
+                    text = limpiar(a.get_text())
+                    if len(text) >= 8 and re.search(r'\d{5,}', href):
+                        link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
+                        if link not in seen:
+                            seen.add(link)
+                            out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                            stats["estrategias"]["E4"] += 1
+            
+            # E5: Fallback - cualquier A con número largo
+            if len(out) < 5:
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if re.search(r'\d{6,}', href):
+                        text = limpiar(a.get_text())
+                        if len(text) >= 8:
+                            link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
+                            if link not in seen and "empleo" in link.lower():
+                                seen.add(link)
+                                out.append(Oferta(source=source, title=text, link=link, location_verified=True))
+                                stats["estrategias"]["E5"] += 1
             
             time.sleep(random.uniform(1, 2))
         
+        stats["total_enlaces"] = len(out)
         set_source_ok(source)
-        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas - {dict([(k, v) for k, v in stats['estrategias'].items() if v > 0])}")
         
     except Exception as e:
         log.exception(f"❌ [{source}] ERROR: {e}")
@@ -785,8 +917,8 @@ def parse_yapo() -> Tuple[List[Oferta], Dict[str, int]]:
     return dedup(out), stats
 
 def dedup(items: List[Oferta]) -> List[Oferta]:
-    seen: Set[str] = set()
-    out: List[Oferta] = []
+    seen = set()
+    out = []
     for o in items:
         k = o.link.strip().lower()
         if k and k not in seen:
@@ -818,7 +950,7 @@ def upsert_job(o: Oferta) -> Tuple[int, str, str]:
             return int(row["id"]), str(row["applied_status"]), "inserted" if row.get("inserted") else "updated"
             
         except Exception as e:
-            log.error(f"Error upsert {o.link}: {e}")
+            log.error(f"Error upsert {o.link[:60]}...: {e}")
             conn.rollback()
             return 0, "unknown", "error"
 
@@ -842,69 +974,69 @@ def run_cycle() -> Dict:
         ("Yapo", parse_yapo),
     ]
     
-    cycle_stats = {"total_encontradas": 0, "nuevas": 0, "existentes": 0, "filtradas": 0, "por_fuente": {}}
+    cycle_stats = {"total": 0, "nuevas": 0, "existentes": 0, "por_fuente": {}}
     
     for nombre, parser in parsers:
         try:
-            log.info(f"\n{'='*60}\n🚀 INICIANDO PARSER: {nombre}\n{'='*60}")
+            log.info(f"\n{'═'*60}\n🚀 {nombre}\n{'═'*60}")
             ofertas, parser_stats = parser()
             cycle_stats["por_fuente"][nombre] = parser_stats
             
-            log.info(f"📊 [{nombre}] Stats: {parser_stats}")
-            
-            nuevas_fuente = 0
-            existentes_fuente = 0
-            filtradas_fuente = 0
+            nuevas = 0
+            existentes = 0
             
             for o in ofertas:
-                cycle_stats["total_encontradas"] += 1
-                
                 if not pasa_filtros(o):
-                    filtradas_fuente += 1
-                    cycle_stats["filtradas"] += 1
                     continue
                 
+                cycle_stats["total"] += 1
                 job_id, status, op = upsert_job(o)
                 
                 if op == "inserted":
-                    nuevas_fuente += 1
+                    nuevas += 1
                     cycle_stats["nuevas"] += 1
-                    
                     code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
                     msg = formatear_oferta(o, code, status)
                     telegram_send(msg)
-                    log.info(f"📨 Notificación enviada: {o.title}")
                 else:
-                    existentes_fuente += 1
+                    existentes += 1
                     cycle_stats["existentes"] += 1
             
-            log.info(f"✅ [{nombre}] {nuevas_fuente} nuevas | {existentes_fuente} existentes | {filtradas_fuente} filtradas")
+            cycle_stats["por_fuente"][nombre]["nuevas"] = nuevas
+            cycle_stats["por_fuente"][nombre]["existentes"] = existentes
+            log.info(f"✅ {nombre}: {nuevas} nuevas | {existentes} existentes")
             
         except Exception as e:
-            log.exception(f"❌ Parser {nombre} falló: {e}")
-            cycle_stats["por_fuente"][nombre] = {"error": str(e)}
+            log.exception(f"❌ {nombre} falló: {e}")
     
     cycle_num = get_state_int("cycle_counter", 0) + 1
     set_state_str("cycle_counter", str(cycle_num))
     
-    log.info(f"\n{'='*60}")
-    log.info(f"CICLO {cycle_num} COMPLETADO")
-    log.info(f"Total: {cycle_stats['total_encontradas']} | Nuevas: {cycle_stats['nuevas']} | Existentes: {cycle_stats['existentes']} | Filtradas: {cycle_stats['filtradas']}")
-    log.info(f"{'='*60}\n")
+    log.info(f"\n{'═'*60}\nCICLO {cycle_num} | Total: {cycle_stats['total']} | Nuevas: {cycle_stats['nuevas']}\n{'═'*60}\n")
     
     if cycle_num % HEARTBEAT_EVERY_CYCLES == 0:
-        msg = f"""🫀 <b>HEARTBEAT CICLO {cycle_num}</b>
+        msg = f"""<b>🫀 CICLO {cycle_num}</b>
 ━━━━━━━━━━━━━━━━━━━━
-📥 Total encontradas: {cycle_stats['total_encontradas']}
-🆕 Nuevas: {cycle_stats['nuevas']}
-📚 Existentes: {cycle_stats['existentes']}
-❌ Filtradas: {cycle_stats['filtradas']}
-━━━━━━━━━━━━━━━━━━━━"""
+📊 <b>RESUMEN</b>
+• Total procesadas: {cycle_stats['total']}
+• Nuevas insertadas: {cycle_stats['nuevas']}
+• Ya existentes: {cycle_stats['existentes']}
+
+━━━━━━━━━━━━━━━━━━━━
+📡 <b>FUENTES ACTIVAS</b>"""
         
         for fuente, stats in cycle_stats["por_fuente"].items():
-            msg += f"\n\n<b>{fuente}</b>:"
-            for k, v in stats.items():
-                msg += f"\n• {k}: {v}"
+            if isinstance(stats, dict) and "error" not in stats:
+                total_fuente = stats.get("total_enlaces", sum([v for k, v in stats.items() if k.startswith("E") or k in ["rss", "scraping"]]))
+                nuevas_fuente = stats.get("nuevas", 0)
+                msg += f"\n\n<b>{fuente}</b>"
+                msg += f"\n✅ {total_fuente} encontradas"
+                msg += f"\n🆕 {nuevas_fuente} nuevas"
+                
+                # Mostrar estrategias exitosas
+                estrategias_ok = [(k, v) for k, v in stats.items() if (k.startswith("E") or k in ["rss", "scraping"]) and v > 0]
+                if estrategias_ok:
+                    msg += f"\n📍 Estrategias: " + ", ".join([f"{k}:{v}" for k, v in estrategias_ok])
         
         telegram_send(msg)
     
@@ -915,7 +1047,7 @@ def main():
         raise RuntimeError("Faltan variables de entorno")
     
     init_db()
-    telegram_send("🚀 <b>BOT OSORNO v5 ULTRA-ROBUSTO</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ 5 fuentes activas\n✅ Múltiples estrategias por fuente\n✅ Parsers resilientes\n✅ Logging detallado DEBUG\n━━━━━━━━━━━━━━━━━━━━")
+    telegram_send("<b>🚀 BOT v6 DEFINITIVO</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ 5 fuentes activas\n✅ 5-7 estrategias por fuente\n✅ Sistema anti-fallas total\n✅ Formato profesional\n━━━━━━━━━━━━━━━━━━━━")
     
     while True:
         start = time.time()
@@ -923,7 +1055,6 @@ def main():
             run_cycle()
         except Exception as e:
             log.exception(f"❌ Ciclo error: {e}")
-            telegram_send(f"❌ <b>Error en ciclo:</b>\n{str(e)[:300]}")
         
         elapsed = time.time() - start
         sleep_time = max(15, INTERVALO - int(elapsed))
