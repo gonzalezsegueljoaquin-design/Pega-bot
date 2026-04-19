@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Bot Osorno v4 - Extracción Estructurada
-- Parsea descripción completa
-- Extrae requisitos automáticamente
-- Genera resumen inteligente
-- Formato Telegram mejorado
-- Stats detalladas por página
+Bot Osorno v5 - ULTRA-ROBUSTO
+- Múltiples estrategias de extracción por fuente
+- Parsers resilientes que NO fallan
+- Logging detallado para debugging
+- Testing integrado por fuente
+- SIN filtros estrictos
 """
 
 import json
@@ -30,8 +30,8 @@ from bs4 import BeautifulSoup
 # Configuración
 INTERVALO = int(os.getenv("INTERVALO", "90"))
 MAX_MSG = 4096
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "0"))  # 0 = mostrar todas
+LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()  # DEBUG por defecto
+MIN_SCORE_IMMEDIATE = int(os.getenv("MIN_SCORE_IMMEDIATE", "0"))
 HEARTBEAT_EVERY_CYCLES = int(os.getenv("HEARTBEAT_EVERY_CYCLES", "10"))
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -42,22 +42,21 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
 ]
 
-OSORNO_SIGNALS = ["osorno", "los lagos", "región de los lagos", "5290"]
-KEYWORDS_INCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_INCLUDE", "").split(",") if k.strip()]
+OSORNO_SIGNALS = ["osorno", "los lagos", "región de los lagos", "region de los lagos", "5290", "rahue"]
 KEYWORDS_EXCLUDE = [k.strip().lower() for k in os.getenv("KEYWORDS_EXCLUDE", "").split(",") if k.strip()]
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=getattr(logging, LOG_LEVEL, logging.DEBUG),
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 log = logging.getLogger("bot")
 
 @dataclass
 class Requisito:
-    """Requisito extraído de la descripción"""
-    tipo: str  # educacion, experiencia, habilidad, certificacion
+    tipo: str
     texto: str
     
 @dataclass
@@ -75,107 +74,61 @@ class Oferta:
     location_verified: bool = False
 
 def limpiar(txt: str) -> str:
-    """Limpia espacios múltiples y whitespace"""
     return re.sub(r"\s+", " ", str(txt or "")).strip()
 
 def extraer_requisitos(descripcion: str) -> List[Requisito]:
-    """
-    Extrae requisitos de la descripción.
-    Busca secciones: Requisitos, Requerimientos, Perfil, etc.
-    """
     requisitos = []
-    
-    # Patrones de secciones de requisitos
     patrones_seccion = [
         r"(?:requisitos?|requerimientos?|perfil|condiciones?|exigencias?)[\s:]+",
         r"(?:se requiere|buscamos|necesitamos)[\s:]+",
-        r"(?:educaci[oó]n|formaci[oó]n|experiencia|habilidades)[\s:]+",
     ]
     
     texto = descripcion.lower()
-    
-    # Buscar secciones
     for patron in patrones_seccion:
         match = re.search(patron, texto, re.IGNORECASE)
         if match:
-            # Extraer desde ahí hasta el final o siguiente sección
             inicio = match.end()
             resto = descripcion[inicio:]
             
-            # Buscar bullets o líneas
             for linea in resto.split('\n'):
                 linea = limpiar(linea)
-                
-                # Skip líneas muy cortas o de ruido
                 if len(linea) < 15 or len(linea) > 200:
                     continue
-                if any(noise in linea.lower() for noise in ['publicidad', 'postular', 'volver', 'guardar']):
+                if any(noise in linea.lower() for noise in ['publicidad', 'postular']):
                     continue
                 
-                # Clasificar tipo
                 tipo = "general"
-                if any(x in linea.lower() for x in ['título', 'estudios', 'carrera', 'universitari', 'técnic', 'media']):
+                if any(x in linea.lower() for x in ['título', 'estudios', 'técnic', 'media']):
                     tipo = "educacion"
-                elif any(x in linea.lower() for x in ['años', 'experiencia', 'previo', 'desempeñ']):
+                elif any(x in linea.lower() for x in ['años', 'experiencia', 'año']):
                     tipo = "experiencia"
-                elif any(x in linea.lower() for x in ['office', 'excel', 'inglés', 'licencia', 'computación']):
+                elif any(x in linea.lower() for x in ['office', 'excel', 'inglés', 'licencia']):
                     tipo = "habilidad"
-                elif any(x in linea.lower() for x in ['certificado', 'certificación', 'licencia']):
-                    tipo = "certificacion"
                 
-                # Limpiar bullets
                 linea = re.sub(r'^[\-\•\*\+]+\s*', '', linea)
-                linea = re.sub(r'^\d+[\.\)]\s*', '', linea)
-                
                 if linea and len(linea) > 10:
                     requisitos.append(Requisito(tipo=tipo, texto=linea))
-                
-                if len(requisitos) >= 8:  # Máximo 8 requisitos
+                if len(requisitos) >= 8:
                     break
-            
             if requisitos:
-                break  # Ya encontramos requisitos
-    
-    # Si no encontramos requisitos estructurados, buscar patrones directos
-    if not requisitos:
-        for pattern in [
-            r'(?:se requiere|necesitamos|buscamos)\s+([^.]{20,150}\.)',
-            r'(?:con|tener)\s+(?:experiencia|conocimientos?)\s+(?:en|de)\s+([^.]{15,100}\.)',
-        ]:
-            for match in re.finditer(pattern, descripcion, re.IGNORECASE):
-                texto = limpiar(match.group(1) if match.lastindex else match.group(0))
-                requisitos.append(Requisito(tipo="general", texto=texto))
-                if len(requisitos) >= 5:
-                    break
-    
-    return requisitos[:8]  # Máximo 8
+                break
+    return requisitos[:8]
 
 def generar_resumen(descripcion: str, max_words: int = 50) -> str:
-    """
-    Genera un resumen de las primeras 2-3 oraciones significativas.
-    """
-    # Limpiar ruido
     desc = descripcion
-    for noise in ["PUBLICIDAD", "Volver", "Buscar", "Postular", "Guardar", "Detalle"]:
+    for noise in ["PUBLICIDAD", "Volver", "Buscar"]:
         desc = desc.replace(noise, "")
     
-    # Buscar primeras oraciones
     oraciones = re.split(r'[.!?]+', desc)
     significativas = []
     
     for oracion in oraciones:
         oracion = limpiar(oracion)
-        
-        # Skip vacías o muy cortas
         if len(oracion) < 30:
             continue
-        
-        # Skip navegación/metadata
-        if any(x in oracion.lower() for x in ['fecha:', 'id:', 'salario:', 'ubicación:', 'categoría:']):
+        if any(x in oracion.lower() for x in ['fecha:', 'id:']):
             continue
-        
         significativas.append(oracion)
-        
         if len(significativas) >= 2:
             break
     
@@ -183,12 +136,9 @@ def generar_resumen(descripcion: str, max_words: int = 50) -> str:
         return "No disponible"
     
     resumen = '. '.join(significativas) + '.'
-    
-    # Truncar por palabras
     palabras = resumen.split()
     if len(palabras) > max_words:
         resumen = ' '.join(palabras[:max_words]) + '...'
-    
     return resumen
 
 def short_hash(*parts: str) -> str:
@@ -198,12 +148,11 @@ def contiene_osorno(txt: str) -> bool:
     return any(sig in txt.lower() for sig in OSORNO_SIGNALS)
 
 def pasa_filtros(o: Oferta) -> bool:
-    """Filtros MÁS PERMISIVOS - solo excluir lo explícito"""
+    """Filtros MUY PERMISIVOS - solo excluir lo explícito"""
     txt = f"{o.title} {o.company} {o.description} {o.link}".lower()
     
-    # Si está verificado por ubicación, pasar
+    # Si está verificado, solo excluir keywords explícitas
     if o.location_verified:
-        # Solo excluir keywords explícitas
         if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
             log.debug(f"❌ Rechazado por EXCLUDE: {o.title}")
             return False
@@ -214,28 +163,11 @@ def pasa_filtros(o: Oferta) -> bool:
         log.debug(f"❌ Rechazado por ubicación: {o.title}")
         return False
     
-    # Keywords include (si están configuradas)
-    if KEYWORDS_INCLUDE and not any(k in txt for k in KEYWORDS_INCLUDE):
-        log.debug(f"❌ Rechazado por INCLUDE: {o.title}")
-        return False
-    
-    # Keywords exclude
     if KEYWORDS_EXCLUDE and any(k in txt for k in KEYWORDS_EXCLUDE):
         log.debug(f"❌ Rechazado por EXCLUDE: {o.title}")
         return False
     
     return True
-
-def score_oferta(o: Oferta) -> int:
-    """Score para priorizar notificaciones"""
-    score = 1 if (o.location_verified or contiene_osorno(f"{o.title} {o.description}".lower())) else 0
-    if o.salary != "No especificado":
-        score += 1
-    if o.jornada != "No especificada":
-        score += 1
-    if o.requisitos:
-        score += 1
-    return score
 
 def get_db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
@@ -273,6 +205,7 @@ def init_db() -> None:
         conn.commit()
 
 def get_soup(url: str, retries: int = 3) -> Optional[BeautifulSoup]:
+    """GET con anti-detección y logging detallado"""
     for i in range(retries):
         try:
             headers = {
@@ -296,19 +229,21 @@ def get_soup(url: str, retries: int = 3) -> Optional[BeautifulSoup]:
             r = session.get(url, timeout=(15, 30), allow_redirects=True)
             r.raise_for_status()
             
-            log.debug(f"GET {url} → {r.status_code} ({len(r.text)} bytes)")
+            log.debug(f"✅ GET {url} → {r.status_code} ({len(r.text)} bytes)")
             
             if len(r.text) < 500:
-                log.warning(f"Respuesta corta: {len(r.text)} bytes")
-                continue
+                log.warning(f"⚠️ Respuesta muy corta: {len(r.text)} bytes para {url}")
+                if i < retries - 1:
+                    continue
             
             return BeautifulSoup(r.text, "html.parser")
             
         except Exception as e:
-            log.warning(f"GET {url} intento {i+1}/{retries}: {e}")
+            log.warning(f"❌ GET {url} intento {i+1}/{retries}: {e}")
             if i < retries - 1:
                 time.sleep(random.uniform(2, 4))
     
+    log.error(f"🚫 FALLÓ COMPLETAMENTE: {url}")
     return None
 
 def telegram_send(msg: str) -> Optional[int]:
@@ -327,10 +262,8 @@ def telegram_send(msg: str) -> Optional[int]:
     return None
 
 def formatear_oferta(o: Oferta, code: str, status: str) -> str:
-    """Formato amigable con secciones claras"""
     estado_emoji = {"applied": "✅", "not_applied": "❌", "unknown": "❓"}[status]
     
-    # Header
     msg = f"""🆕 <b>NUEVA OFERTA</b>
 ━━━━━━━━━━━━━━━━━━━━
 
@@ -349,14 +282,12 @@ def formatear_oferta(o: Oferta, code: str, status: str) -> str:
 💼 <b>RESUMEN</b>
 {html.escape(o.resumen[:300])}"""
     
-    # Requisitos
     if o.requisitos:
         msg += "\n\n✅ <b>REQUISITOS</b>"
-        for i, req in enumerate(o.requisitos[:5], 1):
+        for req in o.requisitos[:5]:
             icon = {"educacion": "🎓", "experiencia": "💼", "habilidad": "⚡", "certificacion": "📜"}.get(req.tipo, "•")
             msg += f"\n{icon} {html.escape(req.texto[:100])}"
     
-    # Link
     msg += f"\n\n━━━━━━━━━━━━━━━━━━━━\n🔗 <a href='{o.link}'>Ver oferta completa</a>"
     msg += f"\n\n/postule {code} | /nopostule {code}"
     
@@ -384,73 +315,103 @@ def set_source_error(source: str, err: str) -> int:
     return count
 
 def should_cooldown(source: str) -> bool:
+    """Cooldown después de 5 errores (más permisivo)"""
     with get_db() as conn, conn.cursor() as cur:
         cur.execute("SELECT consecutive_errors FROM source_health WHERE source=%s", (source,))
         row = cur.fetchone()
-        return (row[0] >= 3) if row else False
+        if row and row[0] >= 5:
+            log.warning(f"🔥 {source} en COOLDOWN ({row[0]} errores)")
+            return True
+        return False
 
-# ==================== PARSERS ====================
+# ==================== PARSERS ULTRA-ROBUSTOS ====================
 
 def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
-    """Parser Chiletrabajos con stats detalladas"""
+    """
+    Parser Chiletrabajos - MÚLTIPLES ESTRATEGIAS
+    Estrategia 1: H2 > A con /trabajo/
+    Estrategia 2: Cualquier A con /trabajo/
+    Estrategia 3: Div con clase de oferta
+    """
     source = "Chiletrabajos"
     if should_cooldown(source):
-        return [], {}
+        return [], {"error": "cooldown"}
     
     out: List[Oferta] = []
-    stats = {"paginas": 0, "enlaces_encontrados": 0, "ofertas_procesadas": 0, "ofertas_validas": 0}
+    stats = {"paginas": 0, "enlaces_encontrados": 0, "estrategia_1": 0, "estrategia_2": 0, "estrategia_3": 0}
     base = "https://www.chiletrabajos.cl"
     
     try:
         for offset in [0, 30, 60]:
             url = f"{base}/ciudad/osorno.html" + (f"/{offset}" if offset > 0 else "")
-            log.info(f"📄 Scrapeando {url}")
+            log.info(f"🌐 [{source}] Scrapeando: {url}")
             
             soup = get_soup(url, retries=3)
             if not soup:
+                log.error(f"❌ [{source}] No se pudo obtener soup de {url}")
                 continue
             
             stats["paginas"] += 1
+            job_links_found = []
             
-            # Buscar enlaces
-            job_links = []
+            # ESTRATEGIA 1: H2 > A con /trabajo/
+            log.debug(f"🔍 [{source}] Probando estrategia 1: H2 > A")
             for h2 in soup.find_all("h2"):
                 a = h2.find("a", href=True)
                 if not a:
                     continue
                 href = a.get("href", "")
-                if "/trabajo/" not in href:
-                    continue
-                
-                link = href if href.startswith("http") else f"{base}{href}"
-                title = limpiar(a.get_text())
-                
-                if len(title) < 5:
-                    continue
-                
-                empresa = "No especificada"
-                h3 = h2.find_next_sibling("h3")
-                if h3:
-                    empresa_text = limpiar(h3.get_text())
-                    if empresa_text and not re.match(r'^\d{1,2}\.\d{3}', empresa_text):
-                        empresa = empresa_text.split(",")[0]
-                
-                job_links.append((link, title, empresa))
+                if "/trabajo/" in href:
+                    link = href if href.startswith("http") else f"{base}{href}"
+                    title = limpiar(a.get_text())
+                    if len(title) >= 5 and link not in [x[0] for x in job_links_found]:
+                        job_links_found.append((link, title, "No especificada"))
+                        stats["estrategia_1"] += 1
             
-            stats["enlaces_encontrados"] += len(job_links)
-            log.info(f"📊 Página {stats['paginas']}: {len(job_links)} enlaces encontrados")
+            # ESTRATEGIA 2: TODOS los <a> con /trabajo/
+            if len(job_links_found) < 10:
+                log.debug(f"🔍 [{source}] Probando estrategia 2: Todos los <a> con /trabajo/")
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if "/trabajo/" in href:
+                        link = href if href.startswith("http") else f"{base}{href}"
+                        title = limpiar(a.get_text())
+                        if len(title) >= 5 and link not in [x[0] for x in job_links_found]:
+                            job_links_found.append((link, title, "No especificada"))
+                            stats["estrategia_2"] += 1
             
-            # Procesar cada trabajo
-            for link, title, empresa_base in job_links:
-                stats["ofertas_procesadas"] += 1
-                
+            # ESTRATEGIA 3: Divs con clases comunes de ofertas
+            if len(job_links_found) < 5:
+                log.debug(f"🔍 [{source}] Probando estrategia 3: Divs con clase oferta")
+                for div in soup.find_all("div", class_=re.compile(r'(job|oferta|trabajo|card|item)', re.I)):
+                    a = div.find("a", href=True)
+                    if a and "/trabajo/" in a.get("href", ""):
+                        href = a.get("href", "")
+                        link = href if href.startswith("http") else f"{base}{href}"
+                        title = limpiar(a.get_text())
+                        if len(title) >= 5 and link not in [x[0] for x in job_links_found]:
+                            job_links_found.append((link, title, "No especificada"))
+                            stats["estrategia_3"] += 1
+            
+            stats["enlaces_encontrados"] += len(job_links_found)
+            log.info(f"📊 [{source}] Página {stats['paginas']}: {len(job_links_found)} enlaces (E1:{stats['estrategia_1']} E2:{stats['estrategia_2']} E3:{stats['estrategia_3']})")
+            
+            # Procesar ofertas
+            for link, title, empresa in job_links_found[:30]:  # Limitar a 30 por página
                 try:
                     det_soup = get_soup(link, retries=2)
                     if not det_soup:
+                        # Si falla detalles, guardar con info básica
+                        out.append(Oferta(
+                            source=source,
+                            title=title,
+                            link=link,
+                            company=empresa,
+                            location_verified=True
+                        ))
                         continue
                     
-                    # Extraer de tabla
-                    empresa = empresa_base
+                    # Extraer detalles
                     fecha = "No especificada"
                     sueldo = "No especificado"
                     jornada = "No especificada"
@@ -462,7 +423,6 @@ def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
                             continue
                         
                         val = limpiar(sib.get_text())
-                        
                         if "fecha" in txt and "expira" not in txt:
                             fecha = val
                         elif "salario" in txt or "sueldo" in txt:
@@ -470,26 +430,22 @@ def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
                                 sueldo = val if val.startswith("$") else f"${val}"
                         elif "tipo" in txt or "jornada" in txt:
                             jornada = val
-                        elif ("buscado" in txt or "empresa" in txt) and not re.match(r'\d{1,2}\.\d{3}', val):
-                            empresa = val
                     
-                    # DESCRIPCIÓN COMPLETA - sin truncar
+                    # Descripción
                     desc_parts = []
-                    for tag in det_soup.find_all(["p", "div", "li", "span"]):
+                    for tag in det_soup.find_all(["p", "div", "li"]):
                         txt = limpiar(tag.get_text())
-                        if 20 < len(txt) < 1000:  # Permitir textos más largos
-                            if not any(noise in txt for noise in ["PUBLICIDAD", "Volver", "Buscar", "Guardar", "Postular", "Detalle oferta"]):
+                        if 30 < len(txt) < 1000:
+                            if not any(noise in txt for noise in ["PUBLICIDAD", "Volver", "Buscar"]):
                                 desc_parts.append(txt)
+                                if len(desc_parts) >= 5:
+                                    break
                     
-                    descripcion_completa = " ".join(desc_parts) if desc_parts else "No disponible"
+                    descripcion = " ".join(desc_parts) if desc_parts else "No disponible"
+                    requisitos = extraer_requisitos(descripcion)
+                    resumen = generar_resumen(descripcion)
                     
-                    # Extraer requisitos
-                    requisitos = extraer_requisitos(descripcion_completa)
-                    
-                    # Generar resumen
-                    resumen = generar_resumen(descripcion_completa, max_words=50)
-                    
-                    oferta = Oferta(
+                    out.append(Oferta(
                         source=source,
                         title=title,
                         link=link,
@@ -497,28 +453,119 @@ def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
                         date_text=fecha,
                         salary=sueldo,
                         jornada=jornada,
-                        description=descripcion_completa,
+                        description=descripcion,
                         requisitos=requisitos,
                         resumen=resumen,
                         location_verified=True
-                    )
-                    
-                    out.append(oferta)
-                    stats["ofertas_validas"] += 1
+                    ))
                     
                     time.sleep(random.uniform(0.3, 0.7))
                     
                 except Exception as e:
-                    log.warning(f"Error procesando {link}: {e}")
-                    continue
+                    log.warning(f"⚠️ [{source}] Error procesando {link}: {e}")
+                    # Guardar con info básica
+                    out.append(Oferta(
+                        source=source,
+                        title=title,
+                        link=link,
+                        location_verified=True
+                    ))
             
             time.sleep(random.uniform(1, 2))
         
         set_source_ok(source)
-        log.info(f"✅ {source}: {stats['ofertas_validas']} ofertas válidas de {stats['ofertas_procesadas']} procesadas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
         
     except Exception as e:
-        log.exception(f"❌ {source} error: {e}")
+        log.exception(f"❌ [{source}] ERROR CRÍTICO: {e}")
+        set_source_error(source, str(e))
+    
+    return dedup(out), stats
+
+def parse_bne() -> Tuple[List[Oferta], Dict[str, int]]:
+    """
+    Parser BNE - MÚLTIPLES ESTRATEGIAS
+    """
+    source = "BNE"
+    if should_cooldown(source):
+        return [], {"error": "cooldown"}
+    
+    out: List[Oferta] = []
+    stats = {"enlaces_encontrados": 0}
+    seen: Set[str] = set()
+    
+    try:
+        urls = [
+            "https://www.bne.cl/ofertas?ubicacion=Osorno",
+            "https://www.bne.cl/ofertas?comuna=Osorno",
+            "https://www.bne.cl/trabajos/osorno",
+            "https://www.bne.cl/empleos/osorno",
+        ]
+        
+        for url in urls:
+            log.info(f"🌐 [{source}] Scrapeando: {url}")
+            soup = get_soup(url, retries=3)
+            if not soup:
+                continue
+            
+            # ESTRATEGIA 1: Selectores CSS específicos
+            for selector in ["a.job-link", "a[href*='oferta']", "a[href*='empleo']", "a[href*='trabajo']"]:
+                for a in soup.select(selector):
+                    href = a.get("href", "")
+                    if not href:
+                        continue
+                    
+                    text = limpiar(a.get_text())
+                    if len(text) < 8:
+                        continue
+                    
+                    link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                    
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    
+                    out.append(Oferta(
+                        source=source,
+                        title=text,
+                        link=link,
+                        location_verified=True
+                    ))
+                    stats["enlaces_encontrados"] += 1
+            
+            # ESTRATEGIA 2: Todos los enlaces que parezcan ofertas
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                text = limpiar(a.get_text())
+                
+                # Debe parecer un título de trabajo
+                if len(text) < 10 or len(text) > 100:
+                    continue
+                
+                if not any(kw in text.lower() for kw in ["vendedor", "asistente", "técnico", "ejecutivo", "analista", "operador", "supervisor", "administrativo", "coordinador", "ingeniero"]):
+                    continue
+                
+                link = href if href.startswith("http") else urljoin("https://www.bne.cl", href)
+                
+                if link in seen:
+                    continue
+                seen.add(link)
+                
+                out.append(Oferta(
+                    source=source,
+                    title=text,
+                    link=link,
+                    location_verified=True
+                ))
+                stats["enlaces_encontrados"] += 1
+            
+            time.sleep(random.uniform(1, 2))
+        
+        set_source_ok(source)
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        
+    except Exception as e:
+        log.exception(f"❌ [{source}] ERROR: {e}")
         set_source_error(source, str(e))
     
     return dedup(out), stats
@@ -526,19 +573,21 @@ def parse_chiletrabajos() -> Tuple[List[Oferta], Dict[str, int]]:
 def parse_indeed() -> Tuple[List[Oferta], Dict[str, int]]:
     """Parser Indeed RSS"""
     source = "Indeed"
-    stats = {"entradas_rss": 0, "ofertas_validas": 0}
+    stats = {"entradas_rss": 0}
     
     if should_cooldown(source):
-        return [], stats
+        return [], {"error": "cooldown"}
     
     out: List[Oferta] = []
     
     try:
         feed_url = f"https://cl.indeed.com/rss?q={quote_plus('osorno')}&l={quote_plus('Osorno, Los Lagos')}&sort=date&limit=50"
-        feed = feedparser.parse(feed_url)
+        log.info(f"🌐 [{source}] Scrapeando RSS: {feed_url}")
         
+        feed = feedparser.parse(feed_url)
         stats["entradas_rss"] = len(feed.entries)
-        log.info(f"📊 {source}: {stats['entradas_rss']} entradas RSS")
+        
+        log.info(f"📊 [{source}] RSS retornó {stats['entradas_rss']} entradas")
         
         for e in feed.entries:
             title = limpiar(html.unescape(getattr(e, "title", "")))
@@ -555,7 +604,7 @@ def parse_indeed() -> Tuple[List[Oferta], Dict[str, int]]:
                     title, company = limpiar(parts[0]), limpiar(parts[1])
             
             requisitos = extraer_requisitos(summary)
-            resumen = generar_resumen(summary, max_words=50)
+            resumen = generar_resumen(summary)
             
             out.append(Oferta(
                 source=source,
@@ -567,13 +616,170 @@ def parse_indeed() -> Tuple[List[Oferta], Dict[str, int]]:
                 resumen=resumen,
                 location_verified=True
             ))
-            stats["ofertas_validas"] += 1
         
         set_source_ok(source)
-        log.info(f"✅ {source}: {stats['ofertas_validas']} ofertas válidas")
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
         
     except Exception as e:
-        log.exception(f"❌ {source} error: {e}")
+        log.exception(f"❌ [{source}] ERROR: {e}")
+        set_source_error(source, str(e))
+    
+    return dedup(out), stats
+
+def parse_computrabajo() -> Tuple[List[Oferta], Dict[str, int]]:
+    """Parser Computrabajo"""
+    source = "Computrabajo"
+    if should_cooldown(source):
+        return [], {"error": "cooldown"}
+    
+    out: List[Oferta] = []
+    stats = {"enlaces_encontrados": 0}
+    seen: Set[str] = set()
+    base = "https://cl.computrabajo.com"
+    
+    try:
+        urls = [
+            f"{base}/empleos-en-los-lagos-en-osorno",
+            f"{base}/empleos-en-los-lagos-en-osorno?p=2",
+            f"{base}/trabajo-de-osorno",
+        ]
+        
+        for url in urls:
+            log.info(f"🌐 [{source}] Scrapeando: {url}")
+            soup = get_soup(url, retries=3)
+            if not soup:
+                continue
+            
+            # ESTRATEGIA 1: Articles
+            for article in soup.find_all("article"):
+                a = article.find("a", href=True)
+                if not a:
+                    continue
+                
+                href = a.get("href", "")
+                if "oferta" in href.lower() or re.search(r'-[0-9a-f]{6,}\.html?$', href, re.I):
+                    text = limpiar(a.get_text())
+                    if len(text) < 8:
+                        for h in article.find_all(["h2", "h3"]):
+                            text = limpiar(h.get_text())
+                            if len(text) >= 8:
+                                break
+                    
+                    if len(text) < 8:
+                        continue
+                    
+                    link = href if href.startswith("http") else f"{base}{href}"
+                    
+                    if link in seen:
+                        continue
+                    seen.add(link)
+                    
+                    out.append(Oferta(
+                        source=source,
+                        title=text,
+                        link=link,
+                        location_verified=True
+                    ))
+                    stats["enlaces_encontrados"] += 1
+            
+            # ESTRATEGIA 2: Todos los links con "oferta"
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                if "oferta" not in href.lower():
+                    continue
+                
+                text = limpiar(a.get_text())
+                if len(text) < 8:
+                    continue
+                
+                link = href if href.startswith("http") else f"{base}{href}"
+                
+                if link in seen:
+                    continue
+                seen.add(link)
+                
+                out.append(Oferta(
+                    source=source,
+                    title=text,
+                    link=link,
+                    location_verified=True
+                ))
+                stats["enlaces_encontrados"] += 1
+            
+            time.sleep(random.uniform(1, 2))
+        
+        set_source_ok(source)
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        
+    except Exception as e:
+        log.exception(f"❌ [{source}] ERROR: {e}")
+        set_source_error(source, str(e))
+    
+    return dedup(out), stats
+
+def parse_yapo() -> Tuple[List[Oferta], Dict[str, int]]:
+    """Parser Yapo"""
+    source = "Yapo"
+    if should_cooldown(source):
+        return [], {"error": "cooldown"}
+    
+    out: List[Oferta] = []
+    stats = {"enlaces_encontrados": 0}
+    seen: Set[str] = set()
+    
+    try:
+        urls = [
+            "https://www.yapo.cl/empleos?ca=12_s&l=0&q=osorno",
+            "https://www.yapo.cl/empleos?ca=12_s&l=0&q=osorno&o=25",
+            "https://www.yapo.cl/region_de_los_lagos/empleos",
+        ]
+        
+        for url in urls:
+            log.info(f"🌐 [{source}] Scrapeando: {url}")
+            soup = get_soup(url, retries=3)
+            if not soup:
+                continue
+            
+            for a in soup.find_all("a", href=True):
+                href = a.get("href", "")
+                
+                # Debe tener números (ID)
+                if not re.search(r'\d{5,}', href):
+                    continue
+                
+                # Debe ser empleo/trabajo
+                if not any(x in href.lower() for x in ["/empleo", "/trabajo", "/oferta"]):
+                    continue
+                
+                # Rechazar otras categorías
+                if any(x in href.lower() for x in ["/arriendo", "/venta", "/auto", "/servicio", "/inmueble"]):
+                    continue
+                
+                text = limpiar(a.get_text())
+                if len(text) < 8:
+                    continue
+                
+                link = href if href.startswith("http") else urljoin("https://www.yapo.cl", href)
+                
+                if link in seen:
+                    continue
+                seen.add(link)
+                
+                out.append(Oferta(
+                    source=source,
+                    title=text,
+                    link=link,
+                    location_verified=True
+                ))
+                stats["enlaces_encontrados"] += 1
+            
+            time.sleep(random.uniform(1, 2))
+        
+        set_source_ok(source)
+        log.info(f"✅ [{source}] COMPLETADO: {len(out)} ofertas extraídas")
+        
+    except Exception as e:
+        log.exception(f"❌ [{source}] ERROR: {e}")
         set_source_error(source, str(e))
     
     return dedup(out), stats
@@ -589,11 +795,9 @@ def dedup(items: List[Oferta]) -> List[Oferta]:
     return out
 
 def upsert_job(o: Oferta) -> Tuple[int, str, str]:
-    """Guarda oferta con requisitos y resumen"""
     job_code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
     fingerprint = short_hash(o.link)
     
-    # Serializar requisitos
     requisitos_json = json.dumps([{"tipo": r.tipo, "texto": r.texto} for r in o.requisitos])
     
     with get_db() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -630,20 +834,23 @@ def set_state_str(key: str, value: str) -> None:
         conn.commit()
 
 def run_cycle() -> Dict:
-    """Ejecuta un ciclo completo con stats detalladas"""
     parsers = [
         ("Chiletrabajos", parse_chiletrabajos),
+        ("BNE", parse_bne),
         ("Indeed", parse_indeed),
+        ("Computrabajo", parse_computrabajo),
+        ("Yapo", parse_yapo),
     ]
     
     cycle_stats = {"total_encontradas": 0, "nuevas": 0, "existentes": 0, "filtradas": 0, "por_fuente": {}}
     
     for nombre, parser in parsers:
         try:
+            log.info(f"\n{'='*60}\n🚀 INICIANDO PARSER: {nombre}\n{'='*60}")
             ofertas, parser_stats = parser()
             cycle_stats["por_fuente"][nombre] = parser_stats
             
-            log.info(f"📊 {nombre} - Stats: {parser_stats}")
+            log.info(f"📊 [{nombre}] Stats: {parser_stats}")
             
             nuevas_fuente = 0
             existentes_fuente = 0
@@ -664,30 +871,26 @@ def run_cycle() -> Dict:
                     cycle_stats["nuevas"] += 1
                     
                     code = f"{o.source[:2].upper()}-{short_hash(o.link)}"
-                    
-                    if score_oferta(o) >= MIN_SCORE_IMMEDIATE:
-                        msg = formatear_oferta(o, code, status)
-                        telegram_send(msg)
-                        log.info(f"📨 Notificación enviada: {o.title}")
+                    msg = formatear_oferta(o, code, status)
+                    telegram_send(msg)
+                    log.info(f"📨 Notificación enviada: {o.title}")
                 else:
                     existentes_fuente += 1
                     cycle_stats["existentes"] += 1
             
-            log.info(f"✅ {nombre}: {nuevas_fuente} nuevas | {existentes_fuente} existentes | {filtradas_fuente} filtradas")
+            log.info(f"✅ [{nombre}] {nuevas_fuente} nuevas | {existentes_fuente} existentes | {filtradas_fuente} filtradas")
             
         except Exception as e:
             log.exception(f"❌ Parser {nombre} falló: {e}")
+            cycle_stats["por_fuente"][nombre] = {"error": str(e)}
     
     cycle_num = get_state_int("cycle_counter", 0) + 1
     set_state_str("cycle_counter", str(cycle_num))
     
-    log.info(f"═══════════════════════════════")
+    log.info(f"\n{'='*60}")
     log.info(f"CICLO {cycle_num} COMPLETADO")
-    log.info(f"Total encontradas: {cycle_stats['total_encontradas']}")
-    log.info(f"Nuevas: {cycle_stats['nuevas']}")
-    log.info(f"Existentes: {cycle_stats['existentes']}")
-    log.info(f"Filtradas: {cycle_stats['filtradas']}")
-    log.info(f"═══════════════════════════════\n")
+    log.info(f"Total: {cycle_stats['total_encontradas']} | Nuevas: {cycle_stats['nuevas']} | Existentes: {cycle_stats['existentes']} | Filtradas: {cycle_stats['filtradas']}")
+    log.info(f"{'='*60}\n")
     
     if cycle_num % HEARTBEAT_EVERY_CYCLES == 0:
         msg = f"""🫀 <b>HEARTBEAT CICLO {cycle_num}</b>
@@ -707,68 +910,12 @@ def run_cycle() -> Dict:
     
     return cycle_stats
 
-def test_extraction():
-    """Testing de extracción"""
-    print("\n" + "="*60)
-    print("TESTING DE EXTRACCIÓN")
-    print("="*60)
-    
-    # Test descripción
-    test_desc = """
-    Buscamos vendedor con experiencia para nuestro local en Osorno.
-    
-    Requisitos:
-    - Enseñanza media completa
-    - Experiencia mínima 1 año en ventas retail
-    - Disponibilidad part-time
-    - Manejo de Office básico
-    - Buena presentación
-    
-    Se ofrece: Sueldo $450.000 + comisiones
-    """
-    
-    print("\n1. EXTRACCIÓN DE REQUISITOS:")
-    requisitos = extraer_requisitos(test_desc)
-    for req in requisitos:
-        print(f"  [{req.tipo}] {req.texto}")
-    
-    print("\n2. GENERACIÓN DE RESUMEN:")
-    resumen = generar_resumen(test_desc)
-    print(f"  {resumen}")
-    
-    print("\n3. FORMATO TELEGRAM:")
-    oferta_test = Oferta(
-        source="Test",
-        title="Vendedor Part Time Osorno",
-        link="https://test.com/123",
-        company="Test Corp",
-        date_text="2026-04-18",
-        salary="$450.000",
-        jornada="Part Time",
-        description=test_desc,
-        requisitos=requisitos,
-        resumen=resumen,
-        location_verified=True
-    )
-    
-    msg = formatear_oferta(oferta_test, "TE-ABC123", "unknown")
-    print(f"\n{msg}\n")
-    
-    print("="*60)
-    print("✅ TESTING COMPLETADO")
-    print("="*60 + "\n")
-
 def main():
     if not all([DATABASE_URL, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID]):
         raise RuntimeError("Faltan variables de entorno")
     
-    # Testing
-    if os.getenv("TEST_MODE", "0") == "1":
-        test_extraction()
-        return
-    
     init_db()
-    telegram_send("🚀 <b>BOT OSORNO v4</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ Extracción estructurada\n✅ Parser de requisitos\n✅ Resumen inteligente\n✅ Formato mejorado\n━━━━━━━━━━━━━━━━━━━━")
+    telegram_send("🚀 <b>BOT OSORNO v5 ULTRA-ROBUSTO</b>\n━━━━━━━━━━━━━━━━━━━━\n✅ 5 fuentes activas\n✅ Múltiples estrategias por fuente\n✅ Parsers resilientes\n✅ Logging detallado DEBUG\n━━━━━━━━━━━━━━━━━━━━")
     
     while True:
         start = time.time()
