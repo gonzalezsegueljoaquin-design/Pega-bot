@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-Bot Osorno v8
+Bot Osorno v9
 ─────────────────────────────────────────────────────
-NUEVO:
-  • fetch de detalle para ofertas nuevas (empresa, salario, descripción real)
-  • /listar [N]      — últimas N ofertas enviadas (default 10)
-  • /postulaciones   — trabajos marcados como postulados
-  • /pendientes      — trabajos sin gestionar
-  • /buscar TEXTO    — buscar en título/empresa
-  • /resumen         — estadísticas generales
-CORREGIDO:
-  • Chiletrabajos: sin fetch de detalle (timeout en IPs de nube)
-  • Computrabajo/BNE/Yapo: enriquece detalle solo en ofertas NUEVAS
-  • No repeats: solo notifica op=="inserted"
-  • applied_status correcto en mensaje de oferta nueva
+FIXES v9:
+  • CRÍTICO: upsert_job ahora usa INSERT ON CONFLICT DO NOTHING + rowcount
+    (el patrón xmax=0 de v8 siempre era True → enviaba duplicados en cada ciclo)
+  • enriquecer_computrabajo: elimina nav/footer del DOM antes de extraer,
+    selectores actualizados, filtro agresivo de frases de ruido de sitio
+  • limpiar_descripcion(): nueva función de filtrado de ruido
+  • generar_resumen(): reescrito con scoring de relevancia y filtro de ruido
+  • extraer_requisitos(): maneja texto continuo (coma/punto) y listas,
+    corta al siguiente encabezado de sección
+  • enriquecer_bne/yapo: aplican limpiar_descripcion
 """
 
 import json
@@ -102,39 +100,191 @@ def pasa_filtros(o: Oferta) -> bool:
         return False
     return True
 
-def extraer_requisitos(desc: str) -> List[Requisito]:
-    requisitos = []
-    for patron in [r"(?:requisitos?|requerimientos?|perfil|condiciones?)[\s:]+",
-                   r"(?:se requiere|buscamos|necesitamos)[\s:]+"]:
-        m = re.search(patron, desc, re.IGNORECASE)
-        if m:
-            for linea in desc[m.end():].split("\n"):
-                linea = limpiar(re.sub(r"^[\-\•\*\+]+\s*", "", linea))
-                if not (15 <= len(linea) <= 200):
-                    continue
-                tipo = "general"
-                if any(x in linea.lower() for x in ["título", "estudios", "técnic", "media"]):
-                    tipo = "educacion"
-                elif any(x in linea.lower() for x in ["años", "experiencia"]):
-                    tipo = "experiencia"
-                elif any(x in linea.lower() for x in ["office", "excel", "inglés", "licencia"]):
-                    tipo = "habilidad"
-                requisitos.append(Requisito(tipo=tipo, texto=linea))
-                if len(requisitos) >= 6:
-                    break
-            if requisitos:
-                break
-    return requisitos
+# ─── Ruido de sitios (texto de navegación / footer que hay que ignorar) ──────
+_NOISE_PHRASES = [
+    # Computrabajo
+    "ingresa y encuentra empleo", "encuentra empleo con una mejor", "mejores empresas para trabajar",
+    "conoce los salarios en el mercado", "únete a nosotros y publica ofertas",
+    "ocultaste esta oferta", "pulsa recuperar oferta", "recuperar oferta para verla",
+    "consejos para encontrar empleo", "ver todas las ofertas", "ver oferta completa",
+    "publicar oferta gratis", "crea tu cv gratis", "regístrate gratis",
+    "no se han encontrado", "volver al inicio", "ver más empleos",
+    "cómo funciona", "sobre nosotros", "política de privacidad",
+    "términos y condiciones", "mapa del sitio", "quiénes somos",
+    "síguenos en", "descarga la app", "empleos por categoría",
+    "inicio empleos empresas", "empleos destacados",
+    # BNE
+    "bolsa nacional de empleo", "capacítate con nosotros",
+    # Yapo
+    "publicar aviso gratis", "vender en yapo",
+    # Chiletrabajos
+    "busca entre miles de empleos", "crea tu hoja de vida",
+    # Genérico
+    "javascript", "cookies", "© copyright", "todos los derechos",
+    "lunes a viernes", "nuestros servicios", "contáctanos",
+    "para más información visita", "haz click aquí",
+]
 
-def generar_resumen(desc: str, max_words: int = 50) -> str:
-    for noise in ["PUBLICIDAD", "Volver", "Buscar"]:
-        desc = desc.replace(noise, "")
-    sigs = [limpiar(s) for s in re.split(r"[.!?]+", desc) if len(limpiar(s)) >= 30][:2]
-    if not sigs:
+def _es_ruido(texto: str) -> bool:
+    """True si el texto es claramente navegación/footer y no contenido de oferta."""
+    t = texto.lower()
+    return any(n in t for n in _NOISE_PHRASES)
+
+def limpiar_descripcion(texto: str) -> str:
+    """
+    Toma el texto crudo extraído del HTML y elimina ruido de navegación.
+    Retorna el texto limpio listo para resumen/requisitos.
+    """
+    if not texto:
         return ""
-    r = ". ".join(sigs) + "."
-    words = r.split()
-    return " ".join(words[:max_words]) + ("…" if len(words) > max_words else "")
+    # Dividir en frases/oraciones (por . ! ? ; o salto de línea)
+    partes = re.split(r"[.!?;\n]", texto)
+    limpias = []
+    for p in partes:
+        p = limpiar(p)
+        if len(p) < 20:
+            continue
+        if _es_ruido(p):
+            continue
+        limpias.append(p)
+    return ". ".join(limpias) if limpias else texto[:500]
+
+def extraer_requisitos(desc: str) -> List[Requisito]:
+    """
+    Extrae requisitos de la descripción de un trabajo.
+    Maneja tanto texto con saltos de línea (listas) como texto continuo
+    donde los ítems van separados por coma, punto o punto y coma.
+    Filtra ruido de sitio antes de procesar.
+    """
+    if not desc:
+        return []
+
+    requisitos: List[Requisito] = []
+
+    # ── Paso 1: encontrar sección de requisitos ────────────────────────────
+    seccion_patron = re.compile(
+        r"(?:requisitos?|requerimientos?|perfil\s+requerido|condiciones?\s+del?\s+cargo"
+        r"|se\s+requiere|buscamos|necesitamos|postulantes?\s+deben"
+        r"|lo\s+que\s+buscamos|exigencias?)\s*[:：]?\s*",
+        re.IGNORECASE
+    )
+    # Encontrar el inicio de la sección
+    m = seccion_patron.search(desc)
+    if not m:
+        return []
+
+    seccion = desc[m.end():]
+
+    # Cortar en el próximo encabezado de sección (ofrecemos, beneficios, funciones, etc.)
+    corte = re.compile(
+        r"\n\s*(?:funciones?|responsabilidades?|ofrecemos?|beneficios?|descripci[oó]n"
+        r"|lo\s+que\s+ofrecemos|condiciones?\s+laborales?|informaci[oó]n\s+adicional)\s*[:：]",
+        re.IGNORECASE
+    )
+    mc = corte.search(seccion)
+    if mc:
+        seccion = seccion[:mc.start()]
+
+    # ── Paso 2: extraer ítems ────────────────────────────────────────────────
+    def clasificar(linea: str) -> str:
+        l = linea.lower()
+        if any(x in l for x in ["título", "titulado", "egresado", "carrera", "estudios",
+                                  "técnic", "profesional", "licenciado", "media", "bachiller"]):
+            return "educacion"
+        if any(x in l for x in ["año", "experiencia", "mínimo", "meses"]):
+            return "experiencia"
+        if any(x in l for x in ["office", "excel", "word", "inglés", "licencia", "manejo",
+                                  "software", "sistema", "idioma"]):
+            return "habilidad"
+        return "general"
+
+    def agregar(linea: str):
+        linea = limpiar(re.sub(r"^[\-\•\*\+►▪◦→\d\.]+\s*", "", linea))
+        if not linea or len(linea) < 10 or len(linea) > 220:
+            return
+        if _es_ruido(linea):
+            return
+        # Evitar duplicados similares
+        for r in requisitos:
+            if linea[:30].lower() in r.texto.lower():
+                return
+        requisitos.append(Requisito(tipo=clasificar(linea), texto=linea))
+
+    # Intentar primero por líneas (formato lista)
+    lineas = [l for l in seccion.split("\n") if limpiar(l)]
+    items_linea = [l for l in lineas if len(limpiar(l)) >= 10]
+
+    if len(items_linea) >= 2:
+        for linea in items_linea:
+            if len(requisitos) >= 7:
+                break
+            agregar(linea)
+    else:
+        # Texto continuo: dividir por coma, punto y coma, o "y "
+        piezas = re.split(r"[,;]|\s+y\s+(?=[A-ZÁÉÍÓÚÑ])", seccion)
+        for pieza in piezas:
+            if len(requisitos) >= 7:
+                break
+            agregar(pieza)
+
+    return requisitos[:7]
+
+def generar_resumen(desc: str, max_palabras: int = 60) -> str:
+    """
+    Genera un resumen limpio del puesto a partir de la descripción.
+    Filtra agresivamente el ruido de sitio y elige las oraciones más informativas.
+    """
+    if not desc:
+        return ""
+
+    # Limpiar ruido primero
+    desc_limpia = limpiar_descripcion(desc)
+    if not desc_limpia:
+        return ""
+
+    # Dividir en oraciones
+    oraciones = [limpiar(s) for s in re.split(r"[.!?]+", desc_limpia)]
+
+    # Palabras que indican contenido relevante del puesto
+    _PALABRAS_RELEVANTES = [
+        "busca", "requiere", "ofrece", "cargo", "puesto", "trabajo", "función",
+        "responsabilidad", "contrato", "salario", "sueldo", "empresa", "postular",
+        "candidato", "perfil", "experiencia", "años", "jornada", "beneficio",
+        "incorporar", "incorporamos", "necesitamos", "buscamos",
+    ]
+
+    def puntaje(o: str) -> int:
+        ol = o.lower()
+        pts = sum(1 for w in _PALABRAS_RELEVANTES if w in ol)
+        # Penalizar oraciones muy cortas o que empiecen con "Si" (condicionales)
+        if len(o) < 40:
+            pts -= 2
+        if ol.startswith("si "):
+            pts -= 1
+        return pts
+
+    # Ordenar por relevancia, luego tomar las 2 mejores
+    candidatas = [(puntaje(o), i, o) for i, o in enumerate(oraciones) if 35 <= len(o) <= 350]
+    candidatas.sort(key=lambda x: (-x[0], x[1]))  # mayor puntaje, menor índice
+    mejores = sorted(candidatas[:2], key=lambda x: x[1])  # restaurar orden original
+
+    if not mejores:
+        # Fallback: primeras dos oraciones largas
+        mejores_fb = [(0, i, o) for i, o in enumerate(oraciones) if len(o) >= 35][:2]
+        mejores = sorted(mejores_fb, key=lambda x: x[1])
+
+    if not mejores:
+        return ""
+
+    resumen = ". ".join(m[2] for m in mejores).strip()
+    if not resumen.endswith("."):
+        resumen += "."
+
+    palabras = resumen.split()
+    if len(palabras) > max_palabras:
+        resumen = " ".join(palabras[:max_palabras]) + "…"
+
+    return resumen
 
 def dedup(items: List[Oferta]) -> List[Oferta]:
     seen, out = set(), []
@@ -216,27 +366,49 @@ def init_db() -> None:
         conn.commit()
 
 def upsert_job(o: Oferta) -> Tuple[int, str, str]:
-    """Inserta o actualiza. Retorna (id, applied_status, 'inserted'|'updated'|'error')."""
+    """
+    Inserta o actualiza un trabajo.
+    Retorna (id, applied_status, 'inserted' | 'updated' | 'error').
+
+    FIX CRÍTICO v9: El patrón (xmax=0) AS inserted de PostgreSQL es SIEMPRE True
+    en ON CONFLICT DO UPDATE porque RETURNING devuelve la nueva tupla cuyo xmax=0.
+    Fix: dos pasos separados — INSERT ON CONFLICT DO NOTHING + rowcount check.
+    """
     code        = make_code(o.source, o.link)
     fingerprint = short_hash(o.link)
     req_json    = json.dumps([{"tipo": r.tipo, "texto": r.texto} for r in o.requisitos])
+
     with get_db() as conn, conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         try:
+            # Paso 1: intentar insertar, ignorar si ya existe
             cur.execute("""
-                INSERT INTO jobs(job_code,source,title,company,link,date_text,salary,jornada,
-                                 description,requisitos,resumen,fingerprint,last_seen_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                ON CONFLICT (link) DO UPDATE
-                    SET last_seen_at = NOW()
-                RETURNING id, applied_status, (xmax=0) AS inserted
+                INSERT INTO jobs(job_code, source, title, company, link, date_text, salary,
+                                 jornada, description, requisitos, resumen, fingerprint)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (link) DO NOTHING
+                RETURNING id, applied_status
             """, (code, o.source, o.title, o.company, o.link, o.date_text, o.salary,
                   o.jornada, o.description, req_json, o.resumen, fingerprint))
+
             row = cur.fetchone()
-            if not row:
-                cur.execute("SELECT id, applied_status FROM jobs WHERE link=%s", (o.link,))
-                row = cur.fetchone()
             conn.commit()
-            return int(row["id"]), str(row["applied_status"]), "inserted" if row.get("inserted") else "updated"
+
+            if row:
+                # rowcount > 0 → realmente fue insertada (NUEVA)
+                return int(row["id"]), str(row["applied_status"]), "inserted"
+
+            # Paso 2: ya existía → solo actualizar last_seen_at
+            cur.execute("""
+                UPDATE jobs SET last_seen_at = NOW()
+                WHERE link = %s
+                RETURNING id, applied_status
+            """, (o.link,))
+            row = cur.fetchone()
+            conn.commit()
+            if row:
+                return int(row["id"]), str(row["applied_status"]), "updated"
+            return 0, "unknown", "error"
+
         except Exception as e:
             log.error(f"upsert error {o.link[:60]}: {e}")
             conn.rollback()
@@ -375,78 +547,129 @@ def _texto_o_vacio(soup: BeautifulSoup, *selectors) -> str:
 
 def enriquecer_computrabajo(o: Oferta) -> Oferta:
     """
-    Visita la página de detalle de Computrabajo y extrae:
-    empresa, salario, jornada, fecha, descripción, requisitos.
-    Usa 6 estrategias de fallback para cada campo.
+    Visita la página de detalle de Computrabajo y extrae datos reales.
+    FIX v9: selectores actualizados + filtro agresivo de ruido de sitio.
     """
     soup = get_soup(o.link, retries=2, timeout=14)
     if not soup:
         return o
 
-    # ── Empresa ──────────────────────────────────────────────────────────────
-    company = (_texto_o_vacio(soup,
-        "[data-t='company'] a", "[data-t='company']",
-        "h2.fs16 a", ".box_detail h2 a", ".icoCompany + span",
-        "a[href*='/empresa/']", ".company_name")
-        or o.company)
+    # ── Eliminar del árbol HTML los bloques que son definitivamente ruido ──
+    for sel in ["nav", "footer", "header", ".sidebar", "#sidebar",
+                "[class*='cookie']", "[class*='banner']", "[class*='publicidad']",
+                "[class*='related']", "[class*='recomend']", "[class*='similar']",
+                "[class*='footer']", "[class*='header']", "[class*='nav']",
+                "script", "style", "noscript", "[class*='modal']"]:
+        for el in soup.select(sel):
+            el.decompose()
 
-    # ── Salario ──────────────────────────────────────────────────────────────
-    salary = (_texto_o_vacio(soup,
-        "[data-t='salary']", ".salary", "[class*='salary']",
-        "li.icon-salary", "p.fs13.fc_base2")
-        or "")
+    texto_pagina = soup.get_text(" ")
+
+    # ── Empresa ─────────────────────────────────────────────────────────────
+    # Computrabajo pone la empresa en h2.subtitle > a, o en p con clase fc_base2
+    company = ""
+    for sel in ["h2.subtitle a", "h2.subtitle", "p.subtitle a", "p.subtitle",
+                "[itemprop='hiringOrganization']", "[itemprop='name']",
+                "a[href*='/empresa/']", "a[href*='/company/']",
+                ".company_name", ".icoCompany + span", "h3.fc_base"]:
+        el = soup.select_one(sel)
+        if el:
+            t = limpiar(el.get_text())
+            # Descartar si parece un título de trabajo (muchas palabras en mayúsculas o verbos)
+            if t and len(t) > 1 and len(t) < 80 and not re.search(r"\b(busca|requiere|solicita|necesita)\b", t, re.I):
+                company = t
+                break
+    company = company or o.company
+
+    # ── Salario ─────────────────────────────────────────────────────────────
+    salary = ""
+    for sel in ["[data-t='salary']", ".salary", "li.icon-salary",
+                "[class*='salary']", "[class*='sueldo']", "[class*='remu']",
+                "p.fs16.fc_base", "span.fs19"]:
+        el = soup.select_one(sel)
+        if el:
+            t = limpiar(el.get_text())
+            if t and "$" in t:
+                salary = t
+                break
     if not salary:
-        # Buscar patrón $ en el HTML
-        m = re.search(r"\$[\d\.,]+(?:\s*[-–]\s*\$[\d\.,]+)?(?:\s*(?:netos?|brutos?|mensual|líquido))?",
-                      soup.get_text(), re.IGNORECASE)
+        m = re.search(r"\$\s?[\d\.,]+(?:\s*[-–]\s*\$\s?[\d\.,]+)?(?:\s*(?:netos?|brutos?|mensual|líquido|pesos))?",
+                      texto_pagina, re.IGNORECASE)
         if m:
-            salary = m.group(0)
+            salary = limpiar(m.group(0))
     salary = salary or "No especificado"
 
-    # ── Jornada / tipo contrato ───────────────────────────────────────────────
-    jornada = (_texto_o_vacio(soup,
-        "[data-t='contract']", "[data-t='workday']",
-        "li.icon-clock", "li.icon-workday", "[class*='jornada']",
-        "span.tag_name")
-        or "")
+    # ── Jornada ─────────────────────────────────────────────────────────────
+    jornada = ""
+    for sel in ["[data-t='contract']", "[data-t='workday']", "li.icon-clock",
+                "[class*='jornada']", "[class*='workday']", "[class*='contract']"]:
+        el = soup.select_one(sel)
+        if el:
+            t = limpiar(el.get_text())
+            if t and len(t) < 60:
+                jornada = t
+                break
     if not jornada:
-        texto = soup.get_text().lower()
-        for kw in ["jornada completa", "part time", "media jornada",
-                   "tiempo completo", "tiempo parcial", "turnos"]:
-            if kw in texto:
+        for kw in ["jornada completa", "part time", "part-time", "media jornada",
+                   "tiempo completo", "tiempo parcial", "turnos rotativos"]:
+            if kw in texto_pagina.lower():
                 jornada = kw.title()
                 break
     jornada = jornada or "No especificada"
 
-    # ── Fecha ─────────────────────────────────────────────────────────────────
-    date_text = (_texto_o_vacio(soup,
-        "[data-t='date']", "p.fc_aux.fs13", "span.timeago", "time")
-        or "")
+    # ── Fecha ────────────────────────────────────────────────────────────────
+    date_text = ""
+    for sel in ["[data-t='date']", "time[datetime]", "span.timeago",
+                "p.fc_aux", "[class*='posted']", "[class*='fecha']"]:
+        el = soup.select_one(sel)
+        if el:
+            t = limpiar(el.get("datetime", "") or el.get_text())
+            # Solo tomar si parece una fecha real (tiene dígitos y no es ruido)
+            if t and re.search(r"\d", t) and len(t) < 50 and not _es_ruido(t):
+                date_text = t
+                break
     if not date_text:
-        m = re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", soup.get_text())
+        m = re.search(r"\d{1,2}\s*(?:de\s*)?(?:enero|febrero|marzo|abril|mayo|junio|julio|agosto|"
+                      r"septiembre|octubre|noviembre|diciembre)\s*(?:de\s*)?\d{4}",
+                      texto_pagina, re.IGNORECASE)
+        if m:
+            date_text = m.group(0)
+    if not date_text:
+        m = re.search(r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}", texto_pagina)
         if m:
             date_text = m.group(0)
     date_text = date_text or "No especificada"
 
-    # ── Descripción ───────────────────────────────────────────────────────────
-    desc_html = (soup.select_one("#job_description")
-                 or soup.select_one(".box_description")
-                 or soup.select_one("[class*='description']")
-                 or soup.select_one("section.box_detail"))
-    if desc_html:
-        descripcion = limpiar(desc_html.get_text(" "))
-    else:
-        # Fallback: párrafos largos
-        partes = []
-        for tag in soup.find_all(["p", "li"]):
-            t = limpiar(tag.get_text())
-            if 40 < len(t) < 800:
-                partes.append(t)
-                if len(partes) >= 6:
-                    break
-        descripcion = " ".join(partes)
+    # ── Descripción (contenido real del puesto) ───────────────────────────
+    desc_raw = ""
+    # Intentar selectores específicos del contenedor principal de descripción
+    for sel in ["#job_description", "div.box_description", "div.oferta_desc",
+                "div[id*='description']", "div[class*='job_desc']",
+                "section.box_detail", "div.cont_bloque", "article.box_oferta"]:
+        el = soup.select_one(sel)
+        if el:
+            desc_raw = limpiar(el.get_text(" "))
+            if len(desc_raw) > 100:
+                break
 
-    requisitos = extraer_requisitos(descripcion) if descripcion else []
+    # Fallback: bloques de párrafos con texto sustancial
+    if len(desc_raw) < 100:
+        partes = []
+        for tag in soup.find_all(["p", "li", "div"], recursive=True):
+            # Solo tags directos con texto propio (no sus hijos)
+            t = limpiar(tag.get_text(" "))
+            if 40 < len(t) < 1000 and not _es_ruido(t):
+                # Evitar duplicados
+                if not any(t[:40] in p for p in partes):
+                    partes.append(t)
+                    if len(partes) >= 8:
+                        break
+        desc_raw = " ".join(partes)
+
+    # Filtrar ruido del texto extraído
+    descripcion = limpiar_descripcion(desc_raw)
+
+    requisitos = extraer_requisitos(descripcion)
     resumen    = generar_resumen(descripcion)
 
     o.company     = company
@@ -463,29 +686,33 @@ def enriquecer_bne(o: Oferta) -> Oferta:
     if not soup:
         return o
 
+    # Eliminar ruido estructural
+    for sel in ["nav", "footer", "header", ".sidebar", "script", "style",
+                "[class*='related']", "[class*='similar']"]:
+        for el in soup.select(sel):
+            el.decompose()
+
     company = (_texto_o_vacio(soup,
         ".company-name", "h2.company", "[class*='company']",
-        "a[href*='/empresa']", ".job-company")
-        or o.company)
+        "a[href*='/empresa']", ".job-company") or o.company)
 
     salary = (_texto_o_vacio(soup, ".salary", "[class*='sueldo']", "[class*='salari']") or "")
     if not salary:
-        m = re.search(r"\$[\d\.,]+", soup.get_text())
+        m = re.search(r"\$\s?[\d\.,]+", soup.get_text())
         salary = m.group(0) if m else "No especificado"
 
     jornada = (_texto_o_vacio(soup, "[class*='jornada']", "[class*='contract']") or "No especificada")
-
     date_text = (_texto_o_vacio(soup, ".date", "time", "[class*='fecha']") or "No especificada")
 
-    desc_el = (soup.select_one(".job-description")
-               or soup.select_one("[class*='description']")
+    desc_el = (soup.select_one(".job-description") or soup.select_one("[class*='description']")
                or soup.select_one("article"))
-    descripcion = limpiar(desc_el.get_text(" ")) if desc_el else ""
-    if not descripcion:
+    desc_raw = limpiar(desc_el.get_text(" ")) if desc_el else ""
+    if not desc_raw:
         partes = [limpiar(p.get_text()) for p in soup.find_all("p")
-                  if 40 < len(limpiar(p.get_text())) < 800][:5]
-        descripcion = " ".join(partes)
+                  if 40 < len(limpiar(p.get_text())) < 800 and not _es_ruido(limpiar(p.get_text()))][:5]
+        desc_raw = " ".join(partes)
 
+    descripcion = limpiar_descripcion(desc_raw)
     o.company    = company
     o.salary     = salary
     o.jornada    = jornada
@@ -500,16 +727,19 @@ def enriquecer_yapo(o: Oferta) -> Oferta:
     if not soup:
         return o
 
+    for sel in ["nav", "footer", "header", "script", "style", "[class*='related']"]:
+        for el in soup.select(sel):
+            el.decompose()
+
     company = (_texto_o_vacio(soup, ".seller-name", ".advertiser", "[class*='user']") or o.company)
 
-    salary = ""
-    m = re.search(r"\$[\d\.,]+(?:\s*[-–]\s*\$[\d\.,]+)?", soup.get_text())
+    m = re.search(r"\$\s?[\d\.,]+(?:\s*[-–]\s*\$\s?[\d\.,]+)?", soup.get_text())
     salary = m.group(0) if m else "No especificado"
 
-    desc_el = (soup.select_one(".description")
-               or soup.select_one("[class*='detail']")
+    desc_el = (soup.select_one(".description") or soup.select_one("[class*='detail']")
                or soup.select_one("article"))
-    descripcion = limpiar(desc_el.get_text(" ")) if desc_el else ""
+    desc_raw = limpiar(desc_el.get_text(" ")) if desc_el else ""
+    descripcion = limpiar_descripcion(desc_raw)
 
     o.company    = company
     o.salary     = salary
@@ -1274,11 +1504,12 @@ def main():
     log.info("✅ Hilo de comandos iniciado")
 
     telegram_send(
-        "<b>🚀 BOT v8 INICIADO</b>\n"
+        "<b>🚀 BOT v9 INICIADO</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        "✅ Detalles reales de ofertas (empresa, salario, descripción)\n"
-        "✅ Sin repeticiones de notificaciones\n"
-        "✅ Historial completo via comandos\n"
+        "✅ Sin duplicados (upsert corregido)\n"
+        "✅ Descripciones limpias (sin ruido de sitio)\n"
+        "✅ Requisitos extraídos de la descripción\n"
+        "✅ Resumen inteligente del puesto\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "Escribe /ayuda para ver todos los comandos."
     )
